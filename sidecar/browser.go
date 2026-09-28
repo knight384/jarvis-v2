@@ -57,6 +57,14 @@ type cdpClient struct {
 	// One-shot waiters for CDP events (e.g. Page.loadEventFired).
 	eventMu      sync.Mutex
 	eventWaiters map[string][]chan struct{}
+
+	// The last request the in-browser guard failed (browser_fetch_guard.go),
+	// so a navigation that died as ERR_BLOCKED_BY_CLIENT can say what happened
+	// instead of leaving Chrome's error page to be snapshotted.
+	blockedMu         sync.Mutex
+	lastBlocked       *blockedRequest
+	blockedLoggedAt   time.Time
+	blockedSuppressed int
 }
 
 // waitForEvent returns a channel that closes when the named CDP event next
@@ -279,6 +287,21 @@ func launchCDP(cfg *SidecarConfig, headless bool) (*cdpClient, error) {
 			"build (Chrome, Chromium, Edge, Brave, Vivaldi)", exe, profileDir)
 	}
 
+	// Arm the in-browser local-file guard BEFORE anything can navigate (#526),
+	// and fail closed: a browser whose Fetch interception could not be installed
+	// is one CDP call away from opening a local file, so it is not driven at
+	// all. The browser is still sitting on the about:blank it launched with.
+	//
+	// AFTER the profile check above, not before, and not "as early as possible":
+	// the interception is browser-wide, so arming it on a browser that turned out
+	// to be the user's OWN (one that ignored --user-data-dir) would pause and
+	// fail their own file: loads for as long as we held the pipe.
+	if err := c.installFetchGuard(); err != nil {
+		c.shutdown()
+		return nil, fmt.Errorf("launch browser %q: could not install the browser's local-file guard, "+
+			"so the browser will not be driven: %w", exe, err)
+	}
+
 	if err := c.attachToPage(); err != nil {
 		c.shutdown()
 		return nil, fmt.Errorf("attach to page: %w", err)
@@ -288,6 +311,31 @@ func launchCDP(cfg *SidecarConfig, headless bool) (*cdpClient, error) {
 	// Non-fatal: navigation falls back to a fixed settle delay without it.
 	if _, err := c.send("Page.enable", nil); err != nil {
 		log.Printf("[browser] Page.enable failed (navigation uses fixed delay): %v", err)
+	}
+
+	// A freshly launched browser sits on the about:blank it was given, but the
+	// automation profile is a persistent directory: a restored session can put
+	// the attached tab on something else -- a local file, chrome://settings, a
+	// leftover page. The daemon blanks a tab it adopted in that state rather
+	// than reading it (#521); do the same, so the guards are a backstop here and
+	// not the thing the caller trips over on their first snapshot. Best-effort:
+	// if it fails, the read guards refuse to read the tab anyway.
+	if url, err := c.mainFrameURL(); err == nil && url != "" && !isDrivableURL(url) {
+		log.Printf("[browser] attached tab was showing %s; blanking it", truncateURL(url, 120))
+		raw, err := c.send("Page.navigate", map[string]any{"url": "about:blank"})
+		if err != nil {
+			log.Printf("[browser] could not blank the adopted tab: %v", err)
+		} else {
+			// Page.navigate reports a failure in errorText, not as an error. Worth
+			// a line: a tab that stayed put is one every read will refuse.
+			var nav struct {
+				ErrorText string `json:"errorText"`
+			}
+			if json.Unmarshal(raw, &nav) == nil && nav.ErrorText != "" {
+				log.Printf("[browser] blanking the adopted tab failed: %s (reads of it will be refused)",
+					nav.ErrorText)
+			}
+		}
 	}
 
 	return c, nil
@@ -308,14 +356,29 @@ func (c *cdpClient) attachToPage() error {
 			TargetInfos []struct {
 				TargetID string `json:"targetId"`
 				Type     string `json:"type"`
+				URL      string `json:"url"`
 			} `json:"targetInfos"`
 		}
 		json.Unmarshal(raw, &res)
+		// Prefer a tab showing something the model may be sent to (#526, as the
+		// daemon's connect() does). A tab left on a file: or chrome:// page by a
+		// restored session is adopted only if it is the only one there is, and
+		// launchCDP blanks it before anything reads it.
+		fallback := ""
 		for _, t := range res.TargetInfos {
-			if t.Type == "page" {
+			if t.Type != "page" {
+				continue
+			}
+			if isDrivableURL(t.URL) {
 				targetID = t.TargetID
 				break
 			}
+			if fallback == "" {
+				fallback = t.TargetID
+			}
+		}
+		if targetID == "" {
+			targetID = fallback
 		}
 		if targetID != "" || time.Now().After(deadline) {
 			break
@@ -366,10 +429,12 @@ func (c *cdpClient) readLoop(r io.Reader) {
 				data = data[:n-1]
 			}
 			var msg struct {
-				ID     int64           `json:"id"`
-				Method string          `json:"method"`
-				Result json.RawMessage `json:"result"`
-				Error  json.RawMessage `json:"error"`
+				ID        int64           `json:"id"`
+				Method    string          `json:"method"`
+				SessionID string          `json:"sessionId"`
+				Params    json.RawMessage `json:"params"`
+				Result    json.RawMessage `json:"result"`
+				Error     json.RawMessage `json:"error"`
 			}
 			if json.Unmarshal(data, &msg) == nil {
 				if msg.ID != 0 {
@@ -383,6 +448,13 @@ func (c *cdpClient) readLoop(r io.Reader) {
 						ch <- cdpReply{result: msg.Result, errMsg: msg.Error}
 					}
 				} else if msg.Method != "" {
+					// A paused request is answered on its OWN goroutine: the
+					// answer is a CDP round-trip whose reply only this loop can
+					// deliver, so answering here would deadlock the pipe while
+					// the browser waits (browser_fetch_guard.go).
+					if msg.Method == "Fetch.requestPaused" {
+						go c.handlePausedRequest(msg.SessionID, msg.Params)
+					}
 					// Protocol event — wake anyone waiting on it.
 					c.fireEvent(msg.Method)
 				}
@@ -605,9 +677,21 @@ func getCDPForParams(cfg *SidecarConfig, params map[string]any) (*cdpClient, err
 
 func makeBrowserNavigateHandler(cfg *SidecarConfig) RPCHandler {
 	return func(params map[string]any) (*RPCResult, error) {
-		url, _ := params["url"].(string)
-		if url == "" {
+		rawURL, _ := params["url"].(string)
+		if rawURL == "" {
 			return nil, fmt.Errorf("missing required parameter: url")
+		}
+
+		// The scheme allowlist (#526), before the browser is launched: a URL
+		// that will be refused should not spawn a Chromium. Page.navigate is a
+		// browser-initiated navigation, so Chrome applies none of the checks it
+		// applies to a page's own attempts -- handed a file: URL it opens the
+		// file and the snapshot below hands it to the model. `target` is the
+		// normalised URL, so Chrome parses the scheme and authority that were
+		// checked (browser_url_policy.go).
+		target, err := checkNavigationURL(rawURL)
+		if err != nil {
+			return nil, err
 		}
 
 		cdp, err := getCDPForParams(cfg, params)
@@ -617,8 +701,9 @@ func makeBrowserNavigateHandler(cfg *SidecarConfig) RPCHandler {
 
 		// Register the waiter BEFORE navigating so the event can't be missed
 		loaded := cdp.waitForEvent("Page.loadEventFired")
+		navigatedAt := time.Now()
 
-		result, err := cdp.send("Page.navigate", map[string]any{"url": url})
+		result, err := cdp.send("Page.navigate", map[string]any{"url": target})
 		if err != nil {
 			return nil, fmt.Errorf("navigate failed: %w", err)
 		}
@@ -632,7 +717,20 @@ func makeBrowserNavigateHandler(cfg *SidecarConfig) RPCHandler {
 		}
 		_ = json.Unmarshal(result, &nav)
 		if nav.ErrorText != "" {
-			return nil, fmt.Errorf("navigation to %s failed: %s", url, nav.ErrorText)
+			// The guard failed this navigation -- a redirect into file:, say.
+			// Say so, instead of reporting Chrome's generic "blocked" error and
+			// snapshotting its error page.
+			if blocked := cdp.describeBlockedNavigation(target, nav.ErrorText, navigatedAt); blocked != "" {
+				return nil, fmt.Errorf("%s", blocked)
+			}
+			// truncateURL, not the raw string: `target` can be a multi-megabyte
+			// data: URL, and sanitizeURLInput leaves interior control bytes
+			// alone -- neither belongs in a log line or a model-facing error.
+			asked := ""
+			if target != rawURL {
+				asked = fmt.Sprintf(" (asked for %s)", truncateURL(rawURL, 120))
+			}
+			return nil, fmt.Errorf("navigation to %s%s failed: %s", truncateURL(target, 120), asked, nav.ErrorText)
 		}
 
 		select {
@@ -640,7 +738,7 @@ func makeBrowserNavigateHandler(cfg *SidecarConfig) RPCHandler {
 		case <-time.After(30 * time.Second):
 			// Page may still be usable (SPAs, slow loads) — same fallback as
 			// the daemon's local navigate.
-			log.Printf("[browser] page load timeout for %s, continuing anyway", url)
+			log.Printf("[browser] page load timeout for %s, continuing anyway", truncateURL(target, 120))
 		}
 
 		// Let JS settle (matches the daemon's post-load delay)
@@ -848,12 +946,24 @@ func makeBrowserScreenshotHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, err
 		}
 
+		// A screenshot of a file: page is the file, in pixels (#526).
+		checked, err := cdp.assertNotLocalContent()
+		if err != nil {
+			return nil, err
+		}
+
 		result, err := cdp.send("Page.captureScreenshot", map[string]any{
 			"format":  "png",
 			"quality": 80,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("screenshot failed: %w", err)
+		}
+
+		// The pixels must come from the document that was approved, not from one
+		// that committed while the capture was in flight.
+		if err := cdp.assertSamePage(checked); err != nil {
+			return nil, err
 		}
 
 		var ss struct {
@@ -938,6 +1048,12 @@ func makeBrowserEvaluateHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, err
 		}
 
+		// Script in a file: page can read the file and hand it back (#526).
+		checked, err := cdp.assertNotLocalContent()
+		if err != nil {
+			return nil, err
+		}
+
 		result, err := cdp.send("Runtime.evaluate", map[string]any{
 			"expression":    expression,
 			"returnByValue": true,
@@ -945,6 +1061,12 @@ func makeBrowserEvaluateHandler(cfg *SidecarConfig) RPCHandler {
 		})
 		if err != nil {
 			return nil, fmt.Errorf("evaluate failed: %w", err)
+		}
+
+		// The script ran in whatever document was current WHEN IT RAN: if that is
+		// no longer the one that was approved, its result is not returned.
+		if err := cdp.assertSamePage(checked); err != nil {
+			return nil, err
 		}
 
 		// Unwrap to the same shape the daemon's evaluate tool returns:
