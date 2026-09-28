@@ -5,7 +5,10 @@
  * run_command, read_file, write_file, list_directory
  */
 
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, unlinkSync, chmodSync, renameSync, rmSync, realpathSync } from 'node:fs';
+import {
+  readFileSync, writeFileSync, readdirSync, statSync, existsSync, unlinkSync, chmodSync, renameSync, rmSync,
+  realpathSync, openSync, closeSync, fstatSync, readSync, readlinkSync, constants as fsConstants,
+} from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -15,6 +18,7 @@ import { TerminalExecutor } from '../terminal/executor.ts';
 import { WSLBridge } from '../terminal/wsl-bridge.ts';
 import { BrowserController, type PageSnapshot } from '../browser/session.ts';
 import { checkNavigationUrl } from '../browser/url-policy.ts';
+import { checkUploadPath, pageOrigin, uploadTargetRefusal } from '../browser/upload-policy.ts';
 import type { ToolDefinition, ToolResult } from './registry.ts';
 import type { LLMTool } from '../../llm/provider.ts';
 import { routeToSidecar, autoTargetForCapability, resolveToolTarget } from './sidecar-route.ts';
@@ -30,7 +34,10 @@ const terminal = new TerminalExecutor({ timeout: 30000 });
 export const browser = new BrowserController();
 
 import { isNoLocalTools, LOCAL_DISABLED_MSG, isLocalBrowserDisabled, LOCAL_BROWSER_DISABLED_MSG, getDefaultCwd } from './local-tools-guard.ts';
-import { execOnWrite, policyHome, relativeBases, routedGitRefusal, siteGitRefusal } from './file-path-policy.ts';
+import {
+  execOnWrite, isSecretInode, policyHome, relativeBases, routedGitRefusal, scanForDaemonSecrets, secretInodeRefusal,
+  secretListRefusal, secretRead, secretReadRefusal, secretRefusalTextFor, secretScanRefusal, siteGitRefusal,
+} from './file-path-policy.ts';
 import { forCard } from '../../util/card-text.ts';
 // Re-export for convenience
 export { setNoLocalTools, isNoLocalTools, setDefaultCwd } from './local-tools-guard.ts';
@@ -79,6 +86,168 @@ function siteGitRefusalFor(params: Record<string, unknown>): string | null {
   const path = String(params.path ?? '');
   return siteGitRefusal(path, relativeBases())
     ?? (params.target || autoTargetForCapability('filesystem') ? routedGitRefusal(path) : null);
+}
+
+/**
+ * The file tools' refusal of the daemon's own credentials (#528). Run BEFORE
+ * sidecar routing, like siteGitRefusalFor and for the same reason: a sidecar on
+ * the brain's own machine opens the brain's files, and a routed path is judged
+ * by spelling (see secretRead's name tier), so `read_file {target, path:
+ * "~/.jarvis/.secrets.key"}` is refused too.
+ */
+function secretRefusalFor(params: Record<string, unknown>): string | null {
+  return secretReadRefusal(params.path, { bases: relativeBases() });
+}
+
+/**
+ * The secret verdict for a read, taken ONCE.
+ *
+ * Classifying twice -- once to refuse, once to ask whether the bytes need
+ * scanning -- can disagree: a symlink retargeted in between, an inode cache
+ * invalidated by a concurrent key write, a staging dir appearing. The second
+ * answer was then used only for its `scanOnly` bit, so a definite hit that
+ * appeared late was dropped instead of refusing. One call, both halves used.
+ */
+function secretVerdict(params: Record<string, unknown>): { refusal: string | null; scanOnly: boolean } {
+  const hit = secretRead(params.path, { bases: relativeBases() });
+  if (!hit) return { refusal: null, scanOnly: false };
+  if (hit.scanOnly) return { refusal: null, scanOnly: true };
+  return { refusal: secretRefusalTextFor(params.path, hit), scanOnly: false };
+}
+
+/** What `read_file` will hand back at most, before truncation is reported. */
+const READ_FILE_LIMIT = 100 * 1024;
+
+/**
+ * The largest cut at or below `end` that does not split a UTF-8 sequence.
+ *
+ * The read is bounded in BYTES, which is the point -- the old code decoded the
+ * whole file and then sliced characters -- but cutting mid-sequence puts a U+FFFD
+ * at the end of every truncated non-ASCII file. Walks back at most three
+ * continuation bytes (`10xxxxxx`), so the worst case drops three bytes.
+ */
+function utf8Boundary(buf: Buffer, end: number): number {
+  for (let i = end; i > end - 4 && i > 0; i -= 1) {
+    if ((buf[i - 1]! & 0xc0) !== 0x80) {
+      // `i - 1` starts a sequence; keep it only if it fits entirely before `end`.
+      const lead = buf[i - 1]!;
+      const width = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+      return i - 1 + width <= end ? end : i - 1;
+    }
+  }
+  return end;
+}
+
+/** A file size a person can read at a glance, for an approval card. */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return 'unknown size';
+  if (bytes === 1) return '1 byte';
+  if (bytes < 1024) return `${bytes} bytes`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
+/**
+ * Where a descriptor really landed, or null when the platform cannot say.
+ *
+ * Linux answers through `/proc/self/fd/<n>`, which is the only way to learn the
+ * path a descriptor actually resolved to, and it appends `" (deleted)"` for an
+ * unlinked inode -- stripped, or the suffix would be classified as part of the
+ * name. macOS needs `fcntl(F_GETPATH)`, which node does not expose, and Windows
+ * has no equivalent; both fall back to the path-based verdict already taken,
+ * plus the inode test, which needs no path at all.
+ */
+function descriptorPath(fd: number): string | null {
+  try {
+    return readlinkSync(`/proc/self/fd/${fd}`).replace(/ \(deleted\)$/, '');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read a file the policy has already allowed by path, judging the descriptor
+ * that is actually opened.
+ *
+ * The path was resolved and classified a moment ago; between then and the read
+ * it could have been replaced. So the file is opened once and everything after
+ * that is decided from the descriptor: `fstat` for what kind of file it is and
+ * which inode it is, `/proc/self/fd` for where it landed, and the bytes come
+ * from that same descriptor. Nothing re-resolves the path, so there is nothing
+ * left to swap.
+ *
+ * `O_NONBLOCK` because opening a FIFO for reading otherwise blocks until a
+ * writer appears, and the daemon with it; `fstat` then refuses anything that is
+ * not a regular file, as the pre-checks did.
+ *
+ * The read is bounded rather than slurped: the old code read the whole file and
+ * then took the first 100 KB, so `read_file /proc/kcore` (a REGULAR file of
+ * 140 TB) or any multi-GB file tried to allocate all of it.
+ */
+function readJudgedFile(filePath: string, requested: unknown, scanOnly: boolean): string {
+  let fd: number;
+  try {
+    // O_NONBLOCK so a FIFO cannot hang the daemon on open; O_NOCTTY so that if a
+    // regular file were swapped for a tty between the pre-check and here, the
+    // daemon does not acquire a controlling terminal whose SIGHUP would kill it.
+    // Both are no-ops for a regular file, and undefined on Windows, where
+    // `O_RDONLY | undefined` is still O_RDONLY.
+    fd = openSync(filePath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOCTTY);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return `Error: File not found: ${filePath}`;
+    if (code === 'EACCES') return `Error: Permission denied: ${filePath}`;
+    return `Error: Cannot read ${filePath}: ${code ?? 'open failed'}`;
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return `Error: Not a regular file: ${filePath}`;
+    // Identity, which no spelling and no race can change. An inode of 0 is not
+    // an identity: some network and Windows volumes report it for every file,
+    // and a cached `dev:0` would then refuse everything on that volume.
+    if (st.ino && isSecretInode(st.dev, st.ino)) return secretInodeRefusal(requested);
+    // Where the descriptor really landed, which can differ from the path if it
+    // was retargeted after the pre-checks. A definite verdict refuses; a
+    // scan-only one is carried into the scan below, or a shell rc swapped in
+    // here would come back unscanned.
+    let scan = scanOnly;
+    const landed = descriptorPath(fd);
+    if (landed && landed !== filePath) {
+      const hit = secretRead(landed, { bases: relativeBases() });
+      // Refuse naming the path the CALLER asked for: `landed` is the resolved
+      // path, and putting that in a model-facing message would disclose where a
+      // symlink really goes.
+      if (hit && !hit.scanOnly) return secretRefusalTextFor(requested, hit);
+      if (hit?.scanOnly) scan = true;
+    }
+
+    const buf = Buffer.allocUnsafe(READ_FILE_LIMIT + 1);
+    let n = 0;
+    while (n < buf.length) {
+      const got = readSync(fd, buf, n, buf.length - n, null);
+      if (got <= 0) break;
+      n += got;
+    }
+    const truncated = n > READ_FILE_LIMIT;
+    const content = buf.toString('utf-8', 0, utf8Boundary(buf, Math.min(n, READ_FILE_LIMIT)));
+    // A file that legitimately holds environment settings comes back only if it
+    // does not actually assign one of the daemon's own credentials. Scanning
+    // what is RETURNED is enough: anything past the limit is not returned.
+    if (scan) {
+      const name = scanForDaemonSecrets(content);
+      if (name) return secretScanRefusal(requested, name);
+    }
+    if (!truncated) return content;
+    // A procfs stream reports size 0 while still having bytes, so there is no
+    // honest number to give for it: say what was read rather than inventing one.
+    const size = Number(st.size);
+    return `${content}\n... [truncated, file is ${size > 0 ? `${size} bytes` : `over ${READ_FILE_LIMIT} bytes`}]`;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
@@ -177,6 +346,10 @@ export const readFileTool: ToolDefinition = {
   execute: async (params) => {
     const refused = siteGitRefusalFor(params);
     if (refused) return refused;
+    // Classified once, before routing: a sidecar on this machine opens these
+    // same files, and a routed path is judged by spelling.
+    const verdict = secretVerdict(params);
+    if (verdict.refusal) return verdict.refusal;
     const target = (params.target as string | undefined) || autoTargetForCapability('filesystem');
     if (target) {
       return routeToSidecar(target, 'read_file', { path: params.path }, 'filesystem');
@@ -202,13 +375,10 @@ export const readFileTool: ToolDefinition = {
       return `Error: Not a regular file: ${filePath}`;
     }
 
-    // Limit file size to 100KB
-    if (stat.size > 100 * 1024) {
-      const content = readFileSync(filePath, 'utf-8').slice(0, 100 * 1024);
-      return content + '\n... [truncated, file is ' + stat.size + ' bytes]';
-    }
-
-    return readFileSync(filePath, 'utf-8');
+    // A file that may hold the daemon's environment is returned only if its
+    // bytes do not assign one of its credentials; readJudgedFile decides that
+    // from what it actually reads.
+    return readJudgedFile(filePath, params.path, verdict.scanOnly);
   },
 };
 
@@ -333,6 +503,8 @@ export const listDirectoryTool: ToolDefinition = {
   execute: async (params) => {
     const refused = siteGitRefusalFor(params);
     if (refused) return refused;
+    const secret = secretListRefusal(params.path, { bases: relativeBases() });
+    if (secret) return secret;
     const target = (params.target as string | undefined) || autoTargetForCapability('filesystem');
     if (target) {
       return routeToSidecar(target, 'list_directory', { path: params.path }, 'filesystem');
@@ -958,6 +1130,87 @@ export const browserUploadFileTool: ToolDefinition = {
       description: 'CSS selector for the file input element (default: first input[type="file"] on the page)',
       required: false,
     },
+  },
+  /**
+   * The card IS the review (#507), and for an upload the three things a person
+   * needs are: which file, how big, and who receives it. `rawUiGate` already
+   * forces a click on every call, but its sentence is generic -- and because a
+   * tool's own intent REPLACES it (tool-action-map.ts), the "effect unknown"
+   * warning has to be restated here rather than lost.
+   *
+   * Synchronous, as every authorityGate must be, so the origin comes from the
+   * URL the browser last reported rather than a CDP round trip; `uploadFile`
+   * re-reads it authoritatively and refuses a cross-origin move. A path the
+   * policy will refuse returns null: `execute` does the refusing, with the
+   * reason, and a doomed call gets no card of its own.
+   */
+  authorityGate: (params) => {
+    let real: string;
+    let size: number;
+    try {
+      real = checkUploadPath(String(params.file_path ?? ''));
+      size = Number(statSync(real).size);
+    } catch {
+      return null;
+    }
+    const url = browser.lastKnownPageUrl();
+    // A page that cannot receive a file at all: say so on the card rather than
+    // asking for a click on "Send a local file to null". `execute` refuses it
+    // anyway; this stops the user spending a decision on it.
+    const wrongPage = url === null ? 'no page reported by the browser yet' : uploadTargetRefusal(url);
+    if (wrongPage) {
+      return {
+        actionCategory: 'write_data',
+        confirm: 'always',
+        intent: `This upload will be REFUSED and needs no approval: ${wrongPage} Requested file: ${forCard(real)}`,
+      };
+    }
+    // Through forCard as well: the origin comes from the browser, but it lands
+    // mid-sentence, which is the position that can forge an ending.
+    const origin = forCard(pageOrigin(url!) ?? url!, 120);
+    return {
+      actionCategory: 'write_data',
+      confirm: 'always',
+      // The path goes LAST and in full: it is the value being approved, and
+      // nothing after it can pose as the rest of the sentence.
+      intent: `Send a local file to ${origin} (${formatBytes(size)}). The page receives the file's contents and can `
+        + `forward them anywhere; check that this is the right page and the right file: ${forCard(real)}`,
+    };
+  },
+  /**
+   * Bind what was reviewed. Without this the approval manager falls back to
+   * `() => true` and an upload has no subject binding at all, so a click could
+   * be spent after a reconnect adopted a different tab.
+   *
+   * Three parts, all of which must still hold at execution: the controller's own
+   * epoch guard (the same one every other reviewed browser tool uses, which
+   * catches a reconnect or a dropped request guard), the file's identity, and the
+   * origin the card named.
+   */
+  captureApprovalGuard: (params) => {
+    const epochHolds = browser.captureApprovalGuard();
+    const reviewedOrigin = (() => {
+      const url = browser.lastKnownPageUrl();
+      return url ? pageOrigin(url) : null;
+    })();
+    let fingerprint: string | null = null;
+    try {
+      const real = checkUploadPath(String(params.file_path ?? ''));
+      const st = statSync(real);
+      fingerprint = `${real}\0${st.dev}\0${st.ino}\0${st.size}\0${st.mtimeMs}`;
+    } catch { /* refused or gone: the guard below fails it */ }
+    return () => {
+      if (!epochHolds() || fingerprint === null) return false;
+      try {
+        const real = checkUploadPath(String(params.file_path ?? ''));
+        const st = statSync(real);
+        if (`${real}\0${st.dev}\0${st.ino}\0${st.size}\0${st.mtimeMs}` !== fingerprint) return false;
+      } catch {
+        return false;
+      }
+      const url = browser.lastKnownPageUrl();
+      return reviewedOrigin === (url ? pageOrigin(url) : null);
+    };
   },
   execute: async (params) => {
     // No sidecar route exists for uploads, so the generic "use a sidecar"

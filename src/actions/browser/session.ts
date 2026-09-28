@@ -14,7 +14,7 @@ import { launchChrome, stopChrome, type RunningBrowser } from './chrome-launcher
 import { parseKeyCombo, SUPPORTED_KEYS_HINT } from './keys.ts';
 import { checkNavigationUrl, isDrivableUrl, isLocalContentUrl, knownDevtoolsPorts, registerDevtoolsPort } from './url-policy.ts';
 import { BrowserRequestGuard } from './browser-request-guard.ts';
-import { checkUploadPath } from './upload-policy.ts';
+import { checkUploadPath, pageOrigin, uploadTargetRefusal } from './upload-policy.ts';
 
 export type PageElement = {
   id: number;
@@ -143,6 +143,16 @@ export class BrowserController {
   private profileDir: string | undefined;
   private _connected = false;
   private approvalEpoch = 0;
+  /**
+   * The URL Chrome last reported for the TOP frame -- from the frame tree or the
+   * target list, never from script the page controls. It exists because an
+   * approval gate is synchronous (`authorityGate` must be cheap and must not
+   * act) while every route to the current URL is an async CDP round trip, and
+   * `browser_upload_file`'s card has to name the origin that will receive the
+   * file. Advisory by design: the authoritative check happens at upload time,
+   * which refuses when the origin has moved since the card was built.
+   */
+  private lastReportedUrl: string | null = null;
   private runningBrowser: RunningBrowser | null = null;
   // Coordinates stored from last snapshot — not sent to LLM
   private elementCoords = new Map<number, { x: number; y: number }>();
@@ -269,6 +279,9 @@ export class BrowserController {
     }
 
     this._connected = true;
+    // The tab that was adopted, so a gate has something to name before the
+    // first navigate. `blankAdopted` means it was just blanked.
+    this.lastReportedUrl = blankAdopted ? 'about:blank' : (pageTarget.url ?? null);
     console.log('[BrowserController] Connected to Chrome');
   }
 
@@ -391,11 +404,62 @@ export class BrowserController {
    * browser's frame tree, not from script the page controls.
    */
   private async assertNotLocalContent(): Promise<void> {
-    const tree = await this.cdp.send('Page.getFrameTree');
-    const url = String(tree?.frameTree?.frame?.url ?? '');
+    const url = await this.readTopFrameUrl();
     if (isLocalContentUrl(url)) {
       throw new Error(`Refusing to read ${url.slice(0, 200)}: the browser does not show local files to the model.`);
     }
+  }
+
+  /**
+   * Ask Chrome what the top frame's URL is, and remember it. The frame tree is
+   * the browser's own answer; `location.href` is the page's, and a page that
+   * wants a file attached to it is exactly the party that would lie.
+   */
+  private async readTopFrameUrl(): Promise<string> {
+    return (await this.readTopFrame()).url;
+  }
+
+  /**
+   * Record where the browser is now, best effort. Called after the actions that
+   * can leave a page -- a click, a key press, a submit -- so a later approval
+   * card names the page the model is actually on. A failure here must not fail
+   * the action that succeeded: a stale record costs a refusal at upload time,
+   * which is the safe direction.
+   */
+  private async noteCurrentPage(): Promise<void> {
+    try {
+      await this.readTopFrameUrl();
+    } catch { /* keep the previous record */ }
+  }
+
+  /**
+   * The top frame's URL and loaderId. The loaderId changes on every document
+   * commit, so it is how a caller can tell that the page it checked is still the
+   * page it is acting on -- a URL can be rewritten same-origin by
+   * `history.pushState` without a new document, and a new document can arrive at
+   * the same URL.
+   */
+  private async readTopFrame(): Promise<{ url: string; loaderId: string }> {
+    const tree = await this.cdp.send('Page.getFrameTree');
+    const url = String(tree?.frameTree?.frame?.url ?? '');
+    const loaderId = String(tree?.frameTree?.frame?.loaderId ?? '');
+    // Only ever REPLACE the record, never clear it. A frame that has not
+    // committed a document reports an empty URL, and writing that as null would
+    // put the upload path back into its "nothing reviewed" branch while the
+    // connection still looks healthy -- turning a missing answer into a skipped
+    // check.
+    if (url) this.lastReportedUrl = url;
+    return { url, loaderId };
+  }
+
+  /**
+   * The last URL Chrome reported, for a synchronous approval gate. Null when
+   * nothing has been reported yet. May be stale: a page that navigated itself
+   * since the last navigate or snapshot is not reflected, which is why the
+   * upload path re-reads it and refuses a mismatch rather than trusting this.
+   */
+  lastKnownPageUrl(): string | null {
+    return this.lastReportedUrl;
   }
 
   /**
@@ -403,6 +467,10 @@ export class BrowserController {
    */
   async snapshot(): Promise<PageSnapshot> {
     await this.ensureConnected();
+    // Refresh the browser-reported URL while we are here: a snapshot is what the
+    // model takes after clicking through a site, so this is where an approval
+    // card's idea of the current origin comes from.
+    await this.readTopFrameUrl().catch(() => { /* advisory only */ });
 
     const result = await this.cdp.send('Runtime.evaluate', {
       expression: SNAPSHOT_SCRIPT,
@@ -492,6 +560,10 @@ export class BrowserController {
 
     // Wait for navigation/changes
     await Bun.sleep(1000);
+    // A click is the ordinary way to leave a page, so re-read where the browser
+    // now is: an approval card built after this must name the page the click
+    // landed on, not the one it left (see lastReportedUrl).
+    await this.noteCurrentPage();
 
     const kind = options.double ? 'Double-clicked' : button === 'right' ? 'Right-clicked' : 'Clicked';
     return `${kind} element [${elementId}]`;
@@ -559,6 +631,7 @@ export class BrowserController {
 
     // Let the app react (menu open, mode switch, etc.)
     await Bun.sleep(300);
+    await this.noteCurrentPage();
 
     return `Pressed ${parsed.display}`;
   }
@@ -658,6 +731,7 @@ export class BrowserController {
       await this.pressEnter();
       // Wait for page load after submit
       await Bun.sleep(2000);
+      await this.noteCurrentPage();
       result += ' and pressed Enter';
     }
 
@@ -720,7 +794,36 @@ export class BrowserController {
     // symlink-resolved path the rule was applied to, not the name the model
     // passed.
     const realPath = checkUploadPath(filePath);
+    // The origin the approval card named, BEFORE ensureConnected can refresh it:
+    // a reconnect adopts `pages.find(isDrivableUrl) ?? pages[0]`, a tab the
+    // reviewed page can influence, so comparing the authoritative URL against a
+    // cache that the reconnect just rewrote would compare it with itself.
+    const reviewed = this.lastReportedUrl;
     await this.ensureConnected();
+
+    // Authoritative, from the browser's frame tree. Three refusals:
+    const before = await this.readTopFrame();
+    // (1) a page that cannot legitimately receive a file at all.
+    const opaque = uploadTargetRefusal(before.url);
+    if (opaque) return `Error: Refusing to upload to this page: ${opaque}`;
+    // (2) nothing reviewed. Allowing it would skip the origin check altogether,
+    // and it is reachable: after a daemon restart against a Chrome that outlived
+    // it, `connect()` adopts whatever tab was left open.
+    if (reviewed === null) {
+      return 'Error: Refusing to upload: no page has been reported by the browser yet, so the approval could not name '
+        + 'the page that would receive the file. Take a browser_snapshot first, then ask again.';
+    }
+    // (3) a page that is not the one the click was given for. Compared by
+    // ORIGIN, not by URL: the sites people upload to (Gmail, Drive, GitHub)
+    // rewrite the path constantly with history.pushState, and refusing on that
+    // would refuse every real upload. A cross-origin move is what invalidates a
+    // review.
+    const reviewedOrigin = pageOrigin(reviewed);
+    if (reviewedOrigin !== pageOrigin(before.url)) {
+      return `Error: Refusing to upload: the page moved from ${reviewedOrigin} to ${pageOrigin(before.url) ?? 'an unknown origin'} `
+        + 'since this upload was reviewed. Take a browser_snapshot and ask again, so the approval names the page that '
+        + 'will actually receive the file.';
+    }
 
     // Resolve the file input element
     const query = selector || 'input[type="file"]';
@@ -732,6 +835,17 @@ export class BrowserController {
 
     if (!node.nodeId) {
       return `Error: No file input found matching "${query}". Click the upload/attach button first to trigger the file input.`;
+    }
+
+    // The origin check above and the handoff below are separate round trips, so a
+    // page that navigates in between would receive a file approved for the
+    // previous document. The loaderId changes on every commit, so comparing it
+    // closes that window -- and it catches a same-URL reload, which a URL
+    // comparison cannot.
+    const after = await this.readTopFrame();
+    if (after.loaderId !== before.loaderId || pageOrigin(after.url) !== reviewedOrigin) {
+      return 'Error: Refusing to upload: the page loaded a new document while the upload was being set up. '
+        + 'Take a browser_snapshot and ask again.';
     }
 
     // Set the file on the input element via CDP

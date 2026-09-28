@@ -551,8 +551,16 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
   // Determine data directory: CLI args > config file > default
   const dataDir = userConfig?.dataDir ?? jarvisConfig.daemon.data_dir ?? DEFAULT_DATA_DIR;
-  // browser_upload_file never sends files from here, wherever it is (#521).
-  (await import('../actions/browser/upload-policy.ts')).registerJarvisDataDir(dataDir);
+  // browser_upload_file never sends files from here, wherever it is (#521), and
+  // sends them only from the allowed roots (#527).
+  {
+    const uploadPolicy = await import('../actions/browser/upload-policy.ts');
+    uploadPolicy.registerJarvisDataDir(dataDir);
+    uploadPolicy.registerUploadRoots(jarvisConfig.browser?.upload_roots);
+    // The refusal message tells the assistant to put files here, so it has to
+    // exist. 0700: what is queued for upload is nobody else's business.
+    uploadPolicy.ensureUploadStagingDir();
+  }
 
   // If user specified a custom data dir but no db path, use jarvis.db in that dir
   const dbPath = userConfig?.dbPath ?? jarvisConfig.daemon.db_path ?? path.join(dataDir, 'jarvis.db');
@@ -3304,7 +3312,8 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
           case 'browser_type':        return `Typing into ${trim(args.selector || 'field', 30)}`;
           case 'browser_scroll':      return 'Scrolling';
           case 'browser_evaluate':    return 'Running JS';
-          case 'browser_upload_file': return `Uploading ${trim(args.path, 40)}`;
+          // The parameter is `file_path`; `args.path` read as "Uploading undefined".
+          case 'browser_upload_file': return `Uploading ${trim(args.file_path ?? args.path, 40)}`;
           // Desktop (Win32 UIA)
           case 'desktop_click':        return `Clicking ${trim(args.element_id || args.label || 'element', 50)}`;
           case 'desktop_type':         return `Typing "${trim(args.text, 50)}"`;
@@ -4894,10 +4903,28 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     {
       const { setSiteProjectsDir, setDaemonDataRoots } = await import('../actions/tools/file-path-policy.ts');
       setSiteProjectsDir((jarvisConfig.sites?.projects_dir ?? '~/.jarvis/projects').replace(/^~/, os.homedir()));
+      // Where the keychain and the workflow key really are, which
+      // JARVIS_SECRETS_DIR can put outside every data dir. Resolved through the
+      // owning modules rather than recomputed, and tolerated failing: a read of
+      // a secret is refused by the policy's own env fallback either way, and a
+      // boot must not fail because a key file is unreadable (#528).
+      const secretsDirs: Array<string | null> = [];
+      try {
+        const { keychainDir } = await import('../vault/keychain.ts');
+        secretsDirs.push(keychainDir());
+      } catch { /* the policy falls back to JARVIS_SECRETS_DIR / JARVIS_HOME / ~/.jarvis */ }
+      // The workflow key is deliberately NOT resolved here. It lives in the same
+      // directory keychainDir() returns (both are JARVIS_SECRETS_DIR ||
+      // JARVIS_HOME || ~/.jarvis), and an explicit
+      // JARVIS_WORKFLOW_ENCRYPTION_KEY_FILE is read by the policy itself. Boot
+      // takes exactly one thing from encryption.ts -- the relocation -- so that
+      // a fresh install cannot plant a key a later restore could not replace,
+      // and encryption-key-path.test.ts pins that list.
       setDaemonDataRoots({
         // The engine bundle cache is under ~/.jarvis whatever the data dir.
         dataDirs: [config.dataDir, path.join(os.homedir(), '.jarvis')],
         codeRoots: [sharedRuntime.engineCacheRoot, sharedRuntime.piecesDir, sharedRuntime.metadataCacheFile],
+        secretsDirs,
       });
     }
 
