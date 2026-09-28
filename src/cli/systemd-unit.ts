@@ -320,6 +320,14 @@ function refuseUnreachable(unit: SystemdUnit, manual: string): false {
  * a restart it waited on would kill.
  */
 export function scheduleUnitRestart(unit: SystemdUnit, run: CommandRunner = runCommand): CommandResult {
+  // Resolved here: the transient service gets the manager's PATH.
+  const systemctl = Bun.which('systemctl', { PATH: process.env.PATH ?? '' }) ?? 'systemctl';
+  // Clear the unit's start rate-limit (see clearStartLimit) before scheduling:
+  // this command reports success to the user and then returns, so a start the
+  // limit refuses two seconds later would go unreported. Inline rather than an
+  // ExecStartPre= on the transient unit -- nothing else starts the unit in that
+  // window, and it keeps the reset on the same footing as every other call site.
+  clearStartLimit(unit.name, run);
   return run([
     'systemd-run', '--user', '--quiet', '--collect',
     `--unit=${transientName(unit, 'restart')}`,
@@ -328,10 +336,49 @@ export function scheduleUnitRestart(unit: SystemdUnit, run: CommandRunner = runC
     // A timer's default accuracy is a minute.
     '--timer-property=AccuracySec=100ms',
     '--timer-property=RemainAfterElapse=no',
-    // Resolved here: the transient service gets the manager's PATH.
-    Bun.which('systemctl', { PATH: process.env.PATH ?? '' }) ?? 'systemctl',
+    systemctl,
     '--user', 'restart', unit.name,
   ]);
+}
+
+/**
+ * Clear the unit's start rate-limit before asking systemd to start it.
+ *
+ * The generated unit bounds a crash loop with StartLimitIntervalSec/
+ * StartLimitBurst (src/cli/autostart.ts), and that limit counts EVERY start in
+ * the window, including the deliberate ones below: a few restarts or updates in
+ * quick succession and systemd refuses the next start. Most callers here ask for
+ * the start with `--no-block` or from a transient unit, so without this the CLI
+ * reports success while JARVIS stays down, and only `systemctl --user
+ * reset-failed` brings it back. The blocking ones would at least report the
+ * refusal -- for a limit the user's own `jarvis restart` filled up.
+ *
+ * Advisory: a no-op (exit 0) on a healthy unit, and a failure here must not
+ * stop the start, so the result is ignored.
+ */
+function clearStartLimit(unit: string, run: CommandRunner): void {
+  run(['systemctl', '--user', 'reset-failed', unit]);
+}
+
+/**
+ * Why systemd is not running the unit, when it has given up on it -- null when
+ * the unit is fine, stopped on purpose, or unreadable from here.
+ *
+ * `jarvis status` needs this because the generated unit bounds a crash loop
+ * (StartLimitBurst, src/cli/autostart.ts): once the limit is hit, systemd leaves
+ * the unit `failed` and never starts it again by itself, which otherwise looks
+ * exactly like a daemon the user stopped.
+ */
+export function readUnitFailure(
+  unit: string,
+  run: CommandRunner = runCommand,
+): { result: string; startLimitHit: boolean } | null {
+  const show = run(['systemctl', '--user', 'show', unit, '--property=ActiveState', '--property=Result']);
+  if (show.exitCode !== 0) return null;
+  const state = /ActiveState=(\S*)/.exec(show.stdout)?.[1] ?? '';
+  if (state !== 'failed') return null;
+  const result = /Result=(\S*)/.exec(show.stdout)?.[1] ?? 'failed';
+  return { result, startLimitHit: result === 'start-limit-hit' };
 }
 
 function unitState(unit: string, run: CommandRunner): { state: string; pid: number | null } {
@@ -442,6 +489,7 @@ export async function restartSystemdUnit(unit: SystemdUnit, options: RestartOpti
     console.log(c.cyan(`${unit.name} is already ${before.state}; waiting for it...`));
   } else {
     console.log(c.cyan(`Restarting JARVIS through systemd (${unit.name}, PID ${unit.pid})...`));
+    clearStartLimit(unit.name, run);
     const request = run(['systemctl', '--user', '--no-block', 'restart', unit.name]);
     if (request.exitCode !== 0) {
       console.error(c.red(`✗ systemctl could not restart ${unit.name}: ${describeFailure(request)}`));
@@ -709,6 +757,12 @@ export async function updateThroughSystemd(
     `--unit=${name}`,
     `--description=Update JARVIS (${unit.name})`,
     `--property=RuntimeMaxSec=${options.runtimeMaxSec ?? updaterRuntimeMaxSec(unit)}`,
+    // The safety net that brings JARVIS back however this updater ends. It is
+    // not rate-limited away: the updater clears the unit's start limit before it
+    // stops the unit (stopSystemdUnit), and a stop does not count as a start, so
+    // the counter is still clear whenever this runs. One ExecStopPost, not two:
+    // systemd serializes a transient unit's exec properties with a reset line
+    // before each assignment, so a second one is not safe across a daemon-reload.
     `--property=ExecStopPost=${[systemctl, '--user', '--no-block', 'start', unit.name].map(execArg).join(' ')}`,
     `--setenv=${UPDATE_UNIT_ENV}=${unit.name}`,
     `--setenv=${UPDATE_RUN_ENV}=${runId}`,
@@ -794,6 +848,13 @@ export async function updateThroughSystemd(
  */
 export function stopSystemdUnit(unit: SystemdUnit, run: CommandRunner = runCommand): boolean {
   console.log(c.dim(`  Stopping ${unit.name}${unit.pid > 0 ? ` (PID ${unit.pid})` : ''} before update...`));
+  // BEFORE the stop, which is what makes every start that follows safe: a stop
+  // does not count against the unit's start limit (see clearStartLimit), so the
+  // counter stays clear for the recovery start below, for startSystemdUnit at
+  // the end of a successful update, and for the ExecStopPost safety net if this
+  // updater is killed before it gets there -- none of which could reset it
+  // itself in time.
+  clearStartLimit(unit.name, run);
   const result = run(['systemctl', '--user', 'stop', unit.name], { timeoutMs: stopBudgetMs(unit) });
   if (result.exitCode !== 0) {
     console.error(c.red(`✗ systemctl could not stop ${unit.name}: ${describeFailure(result)}`));
@@ -807,6 +868,10 @@ export function stopSystemdUnit(unit: SystemdUnit, run: CommandRunner = runComma
 /** Start the unit and wait for its daemon. Prints the outcome. */
 export async function startSystemdUnit(unit: SystemdUnit, options: WaitOptions = {}): Promise<boolean> {
   const run = options.run ?? runCommand;
+  // Redundant on the update path, where stopSystemdUnit already cleared it, and
+  // kept anyway: this is the general "start the unit" entry point, and a caller
+  // that has not just stopped it needs the rate-limit cleared (clearStartLimit).
+  clearStartLimit(unit.name, run);
   const result = run(['systemctl', '--user', 'start', unit.name], { timeoutMs: 60_000 });
   if (result.exitCode !== 0) {
     console.error(c.red(`✗ systemctl could not start ${unit.name}: ${describeFailure(result)}`));

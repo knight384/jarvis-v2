@@ -1,9 +1,12 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import {
   canUseSystemdUserService,
+  checkInstalledLaunchdPlist,
+  checkInstalledSystemdUnit,
+  describeAutostartProblem,
   generateLaunchdPlist,
   generateSystemdUnit,
   decodeLaunchctlOutput,
@@ -170,7 +173,20 @@ describe('scheduleSystemdRestart', () => {
       return ok;
     };
     expect(scheduleSystemdRestart(spawn)).toBe(true);
-    expect(calls[0]).toEqual(['systemctl', '--user', '--no-block', 'restart', 'jarvis.service']);
+    // The unit's StartLimitBurst counts deliberate restarts too, so the
+    // rate-limit is cleared BEFORE the restart is queued: otherwise --no-block
+    // returns 0 and this reports success while the unit refuses to start.
+    expect(calls).toEqual([
+      ['systemctl', '--user', 'reset-failed', 'jarvis.service'],
+      ['systemctl', '--user', '--no-block', 'restart', 'jarvis.service'],
+    ]);
+  });
+
+  test('a unit that was never failed still restarts (reset-failed is advisory)', () => {
+    // `reset-failed` exits non-zero for a unit with nothing to reset on some
+    // systemd versions; that must not stop the restart or the report.
+    const spawn: SpawnSyncFn = (cmd) => (cmd.includes('reset-failed') ? fail : ok);
+    expect(scheduleSystemdRestart(spawn)).toBe(true);
   });
 
   test('returns false when systemctl exits non-zero', () => {
@@ -303,5 +319,287 @@ describe('service definitions propagate JARVIS_HOME', () => {
       : [PLIST_LINT!, '--noout', path];
     const r = Bun.spawnSync(cmd, { stdout: 'pipe', stderr: 'pipe' });
     expect({ code: r.exitCode, err: r.stderr.toString().trim() }).toEqual({ code: 0, err: '' });
+  });
+});
+
+// ── The generated unit's restart + open policy (#543, #544) ──────────
+//
+// An installed unit is only rewritten when autostart is reinstalled, so these
+// assert the GENERATOR's text rather than any file on this machine.
+describe('generated systemd unit: restart policy and the open step', () => {
+  /** Split a unit into `{ '[Section]': ['KEY=VALUE', ...] }`, comments dropped. */
+  function sections(unit: string): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+    let current = '';
+    for (const raw of unit.split('\n')) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#') || line.startsWith(';')) continue;
+      if (line.startsWith('[')) {
+        current = line;
+        out[current] ??= [];
+        continue;
+      }
+      (out[current] ??= []).push(line);
+    }
+    return out;
+  }
+
+  function directive(unit: string, section: string, key: string): string[] {
+    return (sections(unit)[section] ?? [])
+      .filter((line) => line.slice(0, line.indexOf('=')) === key)
+      .map((line) => line.slice(line.indexOf('=') + 1));
+  }
+
+  test('ExecStart passes --no-open, so a service start never opens a browser', () => {
+    const execStart = directive(generateSystemdUnit(), '[Service]', 'ExecStart');
+    expect(execStart).toHaveLength(1);
+    // Token-wise: `--no-open` has to be its own argument, since bin/jarvis.ts
+    // matches it with args.includes('--no-open').
+    const argv = execStart[0]!.split(/\s+/);
+    expect(argv).toContain('start');
+    expect(argv).toContain('--foreground');
+    expect(argv).toContain('--no-open');
+  });
+
+  test('a crash is restarted, and a clean exit is left alone', () => {
+    const unit = generateSystemdUnit();
+    // on-failure, not always: `jarvis stop` SIGTERMs the daemon directly and
+    // the drain exits 0. Under `always` systemd would undo a deliberate stop.
+    expect(directive(unit, '[Service]', 'Restart')).toEqual(['on-failure']);
+    expect(directive(unit, '[Service]', 'RestartSec')).toEqual(['5']);
+  });
+
+  test('a fast-failing daemon cannot spin: the start limit is explicit', () => {
+    const unit = generateSystemdUnit();
+    const interval = Number(directive(unit, '[Unit]', 'StartLimitIntervalSec')[0]);
+    const burst = Number(directive(unit, '[Unit]', 'StartLimitBurst')[0]);
+    const restartSec = Number(directive(unit, '[Service]', 'RestartSec')[0]);
+    expect(Number.isFinite(interval)).toBe(true);
+    expect(Number.isFinite(burst)).toBe(true);
+    // The whole burst has to fit inside the window at this RestartSec,
+    // otherwise systemd never reaches the limit and the loop is unbounded.
+    expect(burst * restartSec).toBeLessThan(interval);
+
+    // systemd IGNORES StartLimitIntervalSec in [Service] (it belongs to [Unit]),
+    // which would silently leave the loop unbounded. StartLimitBurst there is
+    // accepted for compatibility, but keep both in one place.
+    for (const key of ['StartLimitIntervalSec', 'StartLimitBurst', 'StartLimitInterval']) {
+      expect(directive(unit, '[Service]', key)).toEqual([]);
+    }
+  });
+
+  test('every line is a directive in a known section', () => {
+    const parsed = sections(generateSystemdUnit());
+    expect(Object.keys(parsed).sort()).toEqual(['[Install]', '[Service]', '[Unit]']);
+    for (const [section, lines] of Object.entries(parsed)) {
+      for (const line of lines) {
+        expect({ section, line }).toEqual({ section, line: expect.stringMatching(/^[A-Za-z][A-Za-z0-9]*=/) });
+      }
+    }
+  });
+});
+
+// ── Is the installed definition still the one we would write? ────────
+//
+// Nothing in the product reinstalls autostart, so a unit written before
+// #543/#544 stays as it is. These check the detector that says so, and above
+// all that it stays QUIET unless it is sure: it can only nag.
+describe('checkInstalledSystemdUnit', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'jarvis-drift-'));
+  afterAll(() => { try { rmSync(dir, { recursive: true, force: true }); } catch {} });
+  let seq = 0;
+  function unitFile(body: string): string {
+    const path = join(dir, `unit-${seq++}.service`);
+    writeFileSync(path, body, 'utf-8');
+    return path;
+  }
+
+  const current = generateSystemdUnit();
+
+  test('the unit we generate today has nothing to report', () => {
+    expect(checkInstalledSystemdUnit(unitFile(current))).toBeNull();
+  });
+
+  test('nothing installed is not drift', () => {
+    expect(checkInstalledSystemdUnit(join(dir, 'absent.service'))).toBeNull();
+  });
+
+  test('the pre-#544 unit is reported for both problems', () => {
+    const old = `[Unit]
+Description=J.A.R.V.I.S. Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/u/.bun/bin/bun /home/u/jarvis/bin/jarvis.ts start --foreground
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`;
+    const drift = checkInstalledSystemdUnit(unitFile(old));
+    expect(drift?.problems.sort()).toEqual(['opens-a-browser', 'unbounded-restarts']);
+  });
+
+  test('a drop-in directory silences it: the override can fix either problem', () => {
+    // docs/SELF_HOSTING.md tells people to `systemctl --user edit`, which writes
+    // jarvis.service.d/override.conf. Reading the main file alone would nag
+    // someone who already fixed it, forever.
+    const path = unitFile('[Service]\nExecStart=/bin/bun /x/jarvis.ts start --foreground\nRestart=always\nRestartSec=5\n');
+    expect(checkInstalledSystemdUnit(path)?.problems).toEqual(['opens-a-browser', 'unbounded-restarts']);
+    mkdirSync(`${path}.d`, { recursive: true });
+    writeFileSync(join(`${path}.d`, 'override.conf'), '[Service]\nRestart=no\n', 'utf-8');
+    expect(checkInstalledSystemdUnit(path)).toBeNull();
+  });
+
+  test('indentation, CRLF and a line continuation are not drift', () => {
+    // systemd accepts all three; a regex over raw lines would read the
+    // continued ExecStart as ending before --no-open.
+    const path = unitFile(
+      '[Service]\r\n  Type=simple\r\n  ExecStart=/bin/bun /x/jarvis.ts \\\r\n    start --foreground --no-open\r\n  Restart=on-failure\r\n  RestartSec=5\r\n  StartLimitBurst=5\r\n',
+    );
+    expect(checkInstalledSystemdUnit(path)).toBeNull();
+  });
+
+  test('an ExecStart reset that ends with --no-open is not drift', () => {
+    const path = unitFile('[Unit]\nStartLimitBurst=5\n\n[Service]\nExecStart=\nExecStart=-/bin/bun /x/jarvis.ts start --foreground --no-open\nRestart=on-failure\nRestartSec=5\n');
+    expect(checkInstalledSystemdUnit(path)).toBeNull();
+  });
+
+  test('a quoted --no-open counts, and --no-open=true does not', () => {
+    const quoted = unitFile('[Service]\nExecStart=/bin/bun /x/jarvis.ts "start" "--foreground" "--no-open"\n');
+    expect(checkInstalledSystemdUnit(quoted)).toBeNull();
+    // bin/jarvis.ts matches the exact token, so this really does open a browser.
+    const valued = unitFile('[Service]\nExecStart=/bin/bun /x/jarvis.ts start --no-open=true\n');
+    expect(checkInstalledSystemdUnit(valued)?.problems).toEqual(['opens-a-browser']);
+  });
+
+  test("a unit JARVIS did not write is not judged at all", () => {
+    // Someone else's jarvis.service: a wrapper script, a container, a shell that
+    // passes --no-open itself. Nagging about it on every `jarvis status` would
+    // be unsilenceable, so the detector only reads units shaped like the ones
+    // generateSystemdUnit writes (`... jarvis.ts start --foreground`).
+    for (const exec of [
+      '/home/u/bin/run-jarvis.sh',
+      '/usr/bin/docker run --rm ghcr.io/vierisid/jarvis',
+      '/bin/sh -c "exec jarvis serve"',
+    ]) {
+      const path = unitFile(`[Service]\nExecStart=${exec}\nRestart=on-failure\nRestartSec=5\n`);
+      expect(checkInstalledSystemdUnit(path)).toBeNull();
+    }
+  });
+
+  test('a unit that does not restart is not reported for restart limits', () => {
+    const path = unitFile('[Service]\nExecStart=/bin/bun /x/jarvis.ts start --no-open\nRestart=no\nRestartSec=5\n');
+    expect(checkInstalledSystemdUnit(path)).toBeNull();
+  });
+
+  test('a short RestartSec is bounded by systemd own default limit', () => {
+    // 5 starts per 10s is the default: at RestartSec=1 systemd reaches it by
+    // itself, so there is nothing to report.
+    const path = unitFile('[Service]\nExecStart=/bin/bun /x/jarvis.ts start --no-open\nRestart=always\nRestartSec=1\n');
+    expect(checkInstalledSystemdUnit(path)).toBeNull();
+  });
+
+  test('a StartLimit key the user set themselves is left alone', () => {
+    for (const key of ['StartLimitBurst=3', 'StartLimitIntervalSec=60', 'StartLimitInterval=60']) {
+      const path = unitFile(`[Unit]\n${key}\n\n[Service]\nExecStart=/bin/bun /x/jarvis.ts start --no-open\nRestart=always\nRestartSec=9\n`);
+      expect(checkInstalledSystemdUnit(path)).toBeNull();
+    }
+  });
+
+  test('StartLimitAction alone does not count as a limit', () => {
+    // It says what to do AT the limit, not what the limit is, so a unit with
+    // only that key is still restarted forever.
+    const path = unitFile('[Unit]\nStartLimitAction=none\n\n[Service]\nExecStart=/bin/bun /x/jarvis.ts start --no-open\nRestart=always\nRestartSec=9\n');
+    expect(checkInstalledSystemdUnit(path)?.problems).toEqual(['unbounded-restarts']);
+  });
+
+  test('a RestartSec written as a time span counts like a bare number', () => {
+    // All valid systemd, and all far enough apart that its default 5-in-10s
+    // limit never fires: the loop really is unbounded.
+    for (const value of ['5s', '5sec', '2min', '10000ms']) {
+      const path = unitFile(`[Service]\nExecStart=/bin/bun /x/jarvis.ts start --no-open\nRestart=always\nRestartSec=${value}\n`);
+      expect(checkInstalledSystemdUnit(path)?.problems).toEqual(['unbounded-restarts']);
+    }
+    // Under 2s, systemd's own default limit ends the loop: nothing to report.
+    for (const value of ['1s', '500ms', '1']) {
+      const path = unitFile(`[Service]\nExecStart=/bin/bun /x/jarvis.ts start --no-open\nRestart=always\nRestartSec=${value}\n`);
+      expect(checkInstalledSystemdUnit(path)).toBeNull();
+    }
+    // Unreadable: stay silent rather than guess.
+    const odd = unitFile('[Service]\nExecStart=/bin/bun /x/jarvis.ts start --no-open\nRestart=always\nRestartSec=infinity\n');
+    expect(checkInstalledSystemdUnit(odd)).toBeNull();
+  });
+
+  test('an empty drop-in directory does not silence it', () => {
+    // A `systemctl edit` somebody aborted leaves the directory with no .conf in
+    // it, and overrides nothing.
+    const path = unitFile('[Service]\nExecStart=/bin/bun /x/jarvis.ts start --foreground\nRestart=on-failure\nRestartSec=5\n');
+    mkdirSync(`${path}.d`, { recursive: true });
+    expect(checkInstalledSystemdUnit(path)?.problems.sort()).toEqual(['opens-a-browser', 'unbounded-restarts']);
+    writeFileSync(join(`${path}.d`, 'override.conf'), '[Service]\nExecStart=\nExecStart=/bin/bun /x/jarvis.ts start --no-open\n', 'utf-8');
+    expect(checkInstalledSystemdUnit(path)).toBeNull();
+  });
+
+  test('every problem has a one-line plain-ASCII description', () => {
+    // The only user-visible strings in the feature (printed by `jarvis status`).
+    for (const problem of ['opens-a-browser', 'unbounded-restarts'] as const) {
+      const text = describeAutostartProblem(problem);
+      expect(text).toMatch(/^[\x20-\x7e]+$/);
+      expect(text.length).toBeGreaterThan(20);
+    }
+    expect(describeAutostartProblem('opens-a-browser')).toContain('browser');
+    expect(describeAutostartProblem('unbounded-restarts')).toContain('restart');
+  });
+
+  test('comments cannot fake a directive', () => {
+    const path = unitFile('[Service]\n# ExecStart=/bin/bun /x/jarvis.ts start --no-open\n; StartLimitBurst=5\nExecStart=/bin/bun /x/jarvis.ts start\nRestart=on-failure\nRestartSec=5\n');
+    expect(checkInstalledSystemdUnit(path)?.problems.sort()).toEqual(['opens-a-browser', 'unbounded-restarts']);
+  });
+});
+
+describe('checkInstalledLaunchdPlist', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'jarvis-drift-plist-'));
+  afterAll(() => { try { rmSync(dir, { recursive: true, force: true }); } catch {} });
+
+  test('the plist we generate today has nothing to report', () => {
+    const path = join(dir, 'current.plist');
+    writeFileSync(path, generateLaunchdPlist(), 'utf-8');
+    expect(checkInstalledLaunchdPlist(path)).toBeNull();
+  });
+
+  test('a --no-open outside ProgramArguments does not count', () => {
+    const path = join(dir, 'decoy.plist');
+    writeFileSync(path, `<plist><dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bun</string>
+    <string>/x/jarvis.ts</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>Comment</key>
+  <string>--no-open</string>
+</dict></plist>
+`, 'utf-8');
+    expect(checkInstalledLaunchdPlist(path)?.problems).toEqual(['opens-a-browser']);
+  });
+
+  test('nothing installed is not drift', () => {
+    expect(checkInstalledLaunchdPlist(join(dir, 'absent.plist'))).toBeNull();
+  });
+});
+
+describe('generated launchd plist: the open step', () => {
+  test('ProgramArguments passes --no-open', () => {
+    const plist = generateLaunchdPlist();
+    // Sliced to the array, so a match under some unrelated key cannot pass it.
+    const start = plist.indexOf('<key>ProgramArguments</key>');
+    expect(start).toBeGreaterThan(-1);
+    const argv = plist.slice(start, plist.indexOf('</array>', start));
+    expect(argv).toContain('<string>--foreground</string>');
+    expect(argv).toContain('<string>--no-open</string>');
   });
 });

@@ -154,6 +154,73 @@ export function getConfiguredPort(configPath?: string): number {
   return readConfiguredPort(configPath) ?? DEFAULT_DAEMON_PORT;
 }
 
+/**
+ * Where the dashboard of the daemon we are ABOUT to start will be, or no URL
+ * at all when it will not listen on TCP.
+ *
+ * `null` is not "use the default": in unix-socket mode there is no localhost
+ * port, and printing or opening `http://localhost:3142` would send the user
+ * (or a browser, on every service start) to whatever else happens to be
+ * listening there.
+ */
+export type DashboardTarget =
+  | { url: string; port: number; source: 'cli' | 'env' | 'config' | 'default' }
+  | { url: null; port: null; source: 'unix-socket' };
+
+/**
+ * Resolve the dashboard URL for `jarvis start`, in the SAME precedence
+ * startDaemon uses to pick the port it binds (src/daemon/index.ts):
+ *
+ *   1. `--port N` on this command line.
+ *   2. `JARVIS_PORT`, which the config loader applies over daemon.port.
+ *   3. `daemon.port` from ~/.jarvis/config.yaml.
+ *   4. The built-in default.
+ *
+ * ...and `daemon.listen: unix:/path` ahead of all of them, because resolveListen
+ * ignores the port entirely when a socket is configured.
+ *
+ * Note this is NOT resolveStopPort's order: that one starts from the lockfile,
+ * which records the port a RUNNING daemon bound. Nothing has bound anything
+ * yet here, and a stale lockfile must not decide where we send a browser.
+ */
+export function resolveDashboardTarget(options?: {
+  cliPort?: unknown;
+  configPath?: string;
+  env?: Record<string, string | undefined>;
+}): DashboardTarget {
+  if (readConfiguredUnixListen(options?.configPath) !== null) {
+    return { url: null, port: null, source: 'unix-socket' };
+  }
+
+  // Each source read once, in order, so the two halves of a branch cannot drift
+  // apart and the config file is not parsed twice.
+  const env = options?.env ?? process.env;
+  const fromCli = validPort(options?.cliPort);
+  const fromEnv = validPort(env.JARVIS_PORT);
+  const fromConfig = fromCli === null && fromEnv === null ? readConfiguredPort(options?.configPath) : null;
+
+  const resolved: { port: number; source: 'cli' | 'env' | 'config' | 'default' } =
+    fromCli !== null ? { port: fromCli, source: 'cli' }
+    : fromEnv !== null ? { port: fromEnv, source: 'env' }
+    : fromConfig !== null ? { port: fromConfig, source: 'config' }
+    : { port: DEFAULT_DAEMON_PORT, source: 'default' };
+
+  return { ...resolved, url: `http://localhost:${resolved.port}` };
+}
+
+/**
+ * What to print for the dashboard, and what to open -- null when there is
+ * nothing to open.
+ *
+ * Here rather than in bin/jarvis.ts so the decision is testable in one place:
+ * the bug in #544 was in the CLI's wiring, not in the port lookup.
+ */
+export function describeDashboard(target: { url: string | null }): { label: string; openUrl: string | null } {
+  return target.url === null
+    ? { label: 'on the unix socket in daemon.listen (no localhost port)', openUrl: null }
+    : { label: target.url, openUrl: target.url };
+}
+
 function validPort(value: unknown): number | null {
   const n = typeof value === 'string' ? Number.parseInt(value, 10) : typeof value === 'number' ? value : NaN;
   return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
