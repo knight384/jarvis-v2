@@ -191,12 +191,21 @@ function createTables(db: Database): void {
       created_at INTEGER NOT NULL,
       completed_at INTEGER,
       result TEXT,
-      sort_order INTEGER DEFAULT 0
+      sort_order INTEGER DEFAULT 0,
+      scope_id TEXT
     )
   `);
 
   // Migration: add sort_order to existing databases
   try { db.run('ALTER TABLE commitments ADD COLUMN sort_order INTEGER DEFAULT 0'); } catch {}
+
+  // Migration: the tool scope of the turn that created this commitment (#571).
+  // A commitment is the one in-scope tool whose whole effect is to schedule a
+  // LATER turn, and the scope is per-turn, so the executor's turn never
+  // carried it. Recording it is the half that can be done safely today; see
+  // daemon/commitment-executor.ts for why the executor does not yet RUN under
+  // it and what that would take.
+  try { db.run('ALTER TABLE commitments ADD COLUMN scope_id TEXT'); } catch {}
 
   db.run(`
     CREATE INDEX IF NOT EXISTS idx_commitments_status ON commitments(status)
@@ -1039,9 +1048,18 @@ function createTables(db: Database): void {
       updated_at INTEGER NOT NULL,
       result_json TEXT,
       question TEXT,
-      paused_conversation TEXT
+      paused_conversation TEXT,
+      context_key TEXT
     )
   `);
+  // Migration: WHICH CHAT created this task (#571) -- `site:<projectId>` for a
+  // project-scoped site chat, null for the ordinary main chat. A task can
+  // pause on ask_for_clarification and be resumed after a daemon restart, at
+  // which point this row is the only memory it has of where it came from. A
+  // chat identity, not a policy: the scope a resumed task RUNS under always
+  // comes from the live turn, and this is only ever compared for equality, so
+  // an unrecognised key refuses rather than widening.
+  try { db.run('ALTER TABLE tasks ADD COLUMN context_key TEXT'); } catch { /* already present */ }
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at DESC)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_at DESC)`);
   ensureSuggestionSchema(db);

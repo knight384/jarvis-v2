@@ -1,4 +1,6 @@
+import type { Database } from 'bun:sqlite';
 import { getDb, generateId } from './schema.ts';
+import { currentTurnScopeId } from '../actions/tools/turn-scope-store.ts';
 
 export type CommitmentPriority = 'low' | 'normal' | 'high' | 'critical';
 export type CommitmentStatus = 'pending' | 'active' | 'completed' | 'failed' | 'escalated';
@@ -34,6 +36,16 @@ export type Commitment = {
   completed_at: number | null;
   result: string | null;
   sort_order: number;
+  /**
+   * Id of the tool scope the turn that created this commitment ran under
+   * (#571) - e.g. `project_site_chat` for a chat bound to one site-builder
+   * project. `null` for a commitment created outside any scope, and for every
+   * row written before the column existed.
+   *
+   * Recorded but NOT yet enforced on execution; daemon/commitment-executor.ts
+   * says exactly why and what closing it needs.
+   */
+  scope_id: string | null;
 };
 
 type CommitmentRow = {
@@ -50,6 +62,8 @@ type CommitmentRow = {
   completed_at: number | null;
   result: string | null;
   sort_order: number;
+  /** Absent on a row read from a database predating the column (#571). */
+  scope_id?: string | null;
 };
 
 /**
@@ -59,7 +73,34 @@ function parseCommitment(row: CommitmentRow): Commitment {
   return {
     ...row,
     retry_policy: row.retry_policy ? JSON.parse(row.retry_policy) : null,
+    scope_id: row.scope_id ?? null,
   };
+}
+
+/**
+ * Whether this database's `commitments` table carries `scope_id` (#571).
+ *
+ * Keyed on the handle, not a module flag, so a DB re-open between hot reloads
+ * is not judged by the previous database's answer -- the same reasoning, and
+ * the same failure if it is got wrong, as `TaskRegistry.contextColumnPresent`.
+ */
+const scopeColumn = new WeakMap<Database, boolean>();
+function commitmentsHaveScopeColumn(db: Database): boolean {
+  const cached = scopeColumn.get(db);
+  if (cached !== undefined) return cached;
+  let present: boolean;
+  try {
+    present = db.query<{ name: string }, []>('PRAGMA table_info(commitments)')
+      .all().some((c) => c.name === 'scope_id');
+  } catch {
+    present = false;
+  }
+  scopeColumn.set(db, present);
+  if (!present) {
+    console.warn('[Commitments] commitments.scope_id is missing; the chat scope a '
+      + 'commitment was created under will not be recorded (#571)');
+  }
+  return present;
 }
 
 /**
@@ -74,15 +115,40 @@ export function createCommitment(
     retry_policy?: RetryPolicy;
     created_from?: string;
     assigned_to?: string;
+    /**
+     * Tool scope of the creating turn; see Commitment.scope_id (#571).
+     *
+     * Defaults to the ambient turn scope, which is what covers the route that
+     * matters: the row the MODEL creates through the `commitments` tool inside
+     * a scoped chat. An explicit value still wins, for callers that know the
+     * scope but do not run inside the tool call (ws-service's auto-created
+     * tracked task).
+     */
+    scope_id?: string;
   }
 ): Commitment {
   const db = getDb();
   const id = generateId();
   const now = Date.now();
   const priority = opts?.priority ?? 'normal';
+  const scopeId = opts?.scope_id ?? currentTurnScopeId() ?? null;
 
+  // `scope_id` is named only when the column is really there (#571).
+  //
+  // The column arrives by `ALTER TABLE ... ADD COLUMN` in a swallowing
+  // try/catch (vault/schema.ts). If that ALTER were ever skipped on an
+  // existing database while this INSERT still named the column, EVERY
+  // commitment write would throw -- and unlike `TaskRegistry.persist`, which
+  // makes the same argument for the same reason, this call is NOT wrapped in
+  // a catch: the throw would surface as a failed chat turn, a failed HTTP
+  // create and a failed extraction. Probing costs one `PRAGMA` per process
+  // and degrades to "provenance not recorded", which the commitment executor
+  // already treats as an unscoped row.
+  const withScope = commitmentsHaveScopeColumn(db);
   const stmt = db.prepare(
-    'INSERT INTO commitments (id, what, when_due, context, priority, status, retry_policy, created_from, assigned_to, created_at, completed_at, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    withScope
+      ? 'INSERT INTO commitments (id, what, when_due, context, priority, status, retry_policy, created_from, assigned_to, created_at, completed_at, result, scope_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      : 'INSERT INTO commitments (id, what, when_due, context, priority, status, retry_policy, created_from, assigned_to, created_at, completed_at, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   );
 
   stmt.run(
@@ -97,7 +163,8 @@ export function createCommitment(
     opts?.assigned_to ?? null,
     now,
     null,
-    null
+    null,
+    ...(withScope ? [scopeId] : [])
   );
 
   return {
@@ -110,6 +177,7 @@ export function createCommitment(
     retry_policy: opts?.retry_policy ?? null,
     created_from: opts?.created_from ?? null,
     assigned_to: opts?.assigned_to ?? null,
+    scope_id: scopeId,
     created_at: now,
     completed_at: null,
     result: null,

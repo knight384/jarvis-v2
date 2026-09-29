@@ -35,7 +35,7 @@ import { getDb } from '../vault/schema.ts';
 import { AgentOrchestrator } from '../agents/orchestrator.ts';
 import { loadRole } from '../roles/loader.ts';
 import { ToolRegistry } from '../actions/tools/registry.ts';
-import type { TurnToolScope } from '../actions/tools/tool-scope.ts';
+import { scopeSystemNote, type TurnToolScope } from '../actions/tools/tool-scope.ts';
 import { BUILTIN_TOOLS, browser } from '../actions/tools/builtin.ts';
 import { createDelegateTool, type DelegateToolDeps } from '../actions/tools/delegate.ts';
 import { createManageAgentsTool, type AgentToolDeps } from '../actions/tools/agents.ts';
@@ -289,7 +289,14 @@ export class AgentService implements Service, IAgentService {
    * result in a single text + done event so the WebSocket UI keeps working.
    * Token-level streaming through the conv path is a Phase 6 follow-up.
    */
-  streamMessage(text: string, channel: string = 'websocket', siteContext?: string, scope?: TurnToolScope | null): {
+  streamMessage(
+    text: string,
+    channel: string = 'websocket',
+    siteContext?: string,
+    scope?: TurnToolScope | null,
+    // Which chat this is, for matching a paused task back to it (#571).
+    contextKey?: string,
+  ): {
     stream: AsyncIterable<LLMStreamEvent>;
     onComplete: (fullText: string) => Promise<void>;
   } {
@@ -298,7 +305,7 @@ export class AgentService implements Service, IAgentService {
     if (activeTurns.isDraining) throw new DrainingError();
     const endTurn = activeTurns.begin();
     try {
-      const inner = this.streamMessageInner(text, channel, siteContext, scope);
+      const inner = this.streamMessageInner(text, channel, siteContext, scope, contextKey);
       return { stream: trackTurnStream(inner.stream, endTurn), onComplete: inner.onComplete };
     } catch (err) {
       endTurn();
@@ -306,22 +313,33 @@ export class AgentService implements Service, IAgentService {
     }
   }
 
-  private streamMessageInner(text: string, channel: string = 'websocket', siteContext?: string, scope?: TurnToolScope | null): {
+  private streamMessageInner(
+    text: string,
+    channel: string = 'websocket',
+    siteContext?: string,
+    scope?: TurnToolScope | null,
+    contextKey?: string,
+  ): {
     stream: AsyncIterable<LLMStreamEvent>;
     onComplete: (fullText: string) => Promise<void>;
   } {
     if (this.convOrchestrator) {
-      // Note: this path already drops `siteContext` -- a project-scoped chat
-      // gets no site prompt block at all when a conversation tier is
-      // configured -- so it is not a site chat in any sense the rest of the
-      // code would recognise, and the scope has nowhere to apply. Both halves
-      // of that want fixing together; see actions/tools/tool-scope.ts.
-      return this.streamMessageConv(text, channel);
+      // Both halves travel now (#571). This branch used to drop `siteContext`
+      // AND `scope`, which made a project-scoped chat on every hosted install
+      // the pre-#561 state exactly: the generic file and shell tools present,
+      // and not even the prompt line that used to be their only restraint.
+      return this.streamMessageConv(text, channel, siteContext, scope, contextKey);
     }
 
     const systemPrompt = this.buildFullSystemPromptParts(channel, text);
     if (siteContext) {
       systemPrompt.dynamic += '\n\n' + siteContext;
+    }
+    // The same correction the conv runner adds, so the two paths present the
+    // model with the same turn: the cached tool guide in the static half
+    // documents the withheld tools, and this says they are not here (#571).
+    if (scope) {
+      systemPrompt.dynamic += '\n\n' + scopeSystemNote(scope);
     }
 
     const stream = this.orchestrator.streamMessage(systemPrompt, text, undefined, undefined, undefined, scope);
@@ -349,7 +367,13 @@ export class AgentService implements Service, IAgentService {
    * runs (during which we surface task lifecycle events via the listener),
    * then the final verbalization text appears.
    */
-  private streamMessageConv(text: string, channel: string): {
+  private streamMessageConv(
+    text: string,
+    channel: string,
+    siteContext?: string,
+    scope?: TurnToolScope | null,
+    contextKey?: string,
+  ): {
     stream: AsyncIterable<LLMStreamEvent>;
     onComplete: (fullText: string) => Promise<void>;
   } {
@@ -376,6 +400,10 @@ export class AgentService implements Service, IAgentService {
           userProfile,
           recentDialogue,
           ambientFacts: ambient,
+        }, {
+          scope: scope ?? null,
+          ...(contextKey ? { contextKey } : {}),
+          ...(siteContext ? { siteContext } : {}),
         }, taskListener)) {
           if (event.type === 'text') {
             // Insert a separator so the acknowledgment text doesn't blur into
@@ -444,6 +472,11 @@ export class AgentService implements Service, IAgentService {
     mediaType: string,
     channel: string = 'websocket',
     siteContext?: string,
+    // Takes a scope for the same reason it takes a siteContext: no caller
+    // passes a project-scoped one today (the pebble is its only caller and
+    // carries no projectId), but the day one does, the scope has to ride
+    // with the site block rather than be remembered separately (#571).
+    scope?: TurnToolScope | null,
   ): {
     stream: AsyncIterable<LLMStreamEvent>;
     onComplete: (fullText: string) => Promise<void>;
@@ -455,6 +488,7 @@ export class AgentService implements Service, IAgentService {
     try {
       const systemPrompt = this.buildFullSystemPromptParts(channel, text);
       if (siteContext) systemPrompt.dynamic += '\n\n' + siteContext;
+      if (scope) systemPrompt.dynamic += '\n\n' + scopeSystemNote(scope);
 
       const content: import('../llm/provider.ts').ContentBlock[] = [
         { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
@@ -476,6 +510,7 @@ export class AgentService implements Service, IAgentService {
         useConvTier ? 'conversation' : 'medium',
         'chat_orchestrator_image',
         useConvTier ? 'medium' : undefined,
+        scope ?? null,
       );
 
       const onComplete = async (fullText: string): Promise<void> => {
@@ -506,7 +541,18 @@ export class AgentService implements Service, IAgentService {
    *   - Otherwise the classic orchestrator runs (full role prompt, all tools,
    *     ReAct loop on the medium tier).
    */
-  async handleMessage(text: string, channel: string = 'websocket'): Promise<string> {
+  async handleMessage(
+    text: string,
+    channel: string = 'websocket',
+    scope?: TurnToolScope | null,
+    // Travels WITH `scope`, always. A scoped turn without it withholds the
+    // generic file tools and then tells the model to "use the site_* tools with
+    // the project's project_id" without ever saying which project -- the
+    // starved turn, reached from the other direction (#571). No caller passes
+    // either today; the pair exists so the first one that does cannot pass one
+    // half.
+    siteContext?: string,
+  ): Promise<string> {
     // Non-streaming turn entry (external channels, etc). Background reactions go
     // through BackgroundAgentService.handleMessage, which is gated separately.
     if (activeTurns.isDraining) throw new DrainingError();
@@ -515,10 +561,12 @@ export class AgentService implements Service, IAgentService {
       let response: string;
 
       if (this.convOrchestrator) {
-        response = await this.handleMessageConv(text, channel);
+        response = await this.handleMessageConv(text, channel, scope, siteContext);
       } else {
         const systemPrompt = this.buildFullSystemPromptParts(channel, text);
-        response = await this.orchestrator.processMessage(systemPrompt, text);
+        if (siteContext) systemPrompt.dynamic += '\n\n' + siteContext;
+        if (scope) systemPrompt.dynamic += '\n\n' + scopeSystemNote(scope);
+        response = await this.orchestrator.processMessage(systemPrompt, text, undefined, undefined, scope ?? null);
       }
 
       // Run extraction and learning in parallel (non-blocking but tracked)
@@ -542,7 +590,12 @@ export class AgentService implements Service, IAgentService {
    * identity + recent dialogue) and lets the conv LLM decide whether to
    * delegate or answer directly.
    */
-  private async handleMessageConv(text: string, channel: string = 'websocket'): Promise<string> {
+  private async handleMessageConv(
+    text: string,
+    channel: string = 'websocket',
+    scope?: TurnToolScope | null,
+    siteContext?: string,
+  ): Promise<string> {
     if (!this.convOrchestrator) {
       // Should be unreachable - caller checks this.convOrchestrator first.
       throw new Error('Conv orchestrator not initialized');
@@ -557,6 +610,7 @@ export class AgentService implements Service, IAgentService {
         recentDialogue,
         ambientFacts: this.buildAmbientFactsBlock(text),
       },
+      { scope: scope ?? null, ...(siteContext ? { siteContext } : {}) },
       this.convTaskEventListener ?? undefined,
     );
     return result.text;
@@ -701,6 +755,8 @@ export class AgentService implements Service, IAgentService {
         originalMessage,
         signal,
         history,
+        scope,
+        siteContext,
       }) => {
         const baseSystem = this.buildFullSystemPromptParts('conv', originalMessage);
         const templateNote = TaskDispatcher.templatePromptFor(template);
@@ -708,9 +764,24 @@ export class AgentService implements Service, IAgentService {
         // tier sees both the user's verbatim ask AND the conv's framing -
         // but the user's words are the primary signal. Both are per-task
         // volatile, so they ride on the dynamic half of the prompt.
+        //
+        // The site block and the scope notice ride there too, and only here:
+        // this is the tier that holds the tool registry, so it is the one
+        // that needs to be told which project it is working in and which
+        // tools this kind of turn does not have (#571). Keeping both out of
+        // the STATIC half matters - that half is the provider's cache prefix,
+        // and a per-chat variation in it would miss the cache on every
+        // hosted turn.
+        const dynamicParts = [
+          baseSystem.dynamic,
+          templateNote,
+          `Conversation routing note: ${intent}`,
+          ...(siteContext ? [siteContext] : []),
+          ...(scope ? [scopeSystemNote(scope)] : []),
+        ];
         const systemPrompt: SystemPromptParts = {
           static: baseSystem.static,
-          dynamic: `${baseSystem.dynamic}\n\n${templateNote}\n\nConversation routing note: ${intent}`,
+          dynamic: dynamicParts.join('\n\n'),
         };
         const result = await this.orchestrator.processTaskCall({
           systemPrompt,
@@ -719,6 +790,7 @@ export class AgentService implements Service, IAgentService {
           subsystem,
           history: history as import('../llm/provider.ts').LLMMessage[] | undefined,
           signal,
+          scope,
           // Every template but `write` exists to DO something, so a final
           // answer that ran no tools is a model that announced its plan and
           // stopped - push back once rather than storing the announcement as
