@@ -476,7 +476,12 @@ describe('generic file tools refuse a site project\'s git internals', () => {
     mkdirSync(join(project, 'node_modules'));
     const linked = join(project, 'node_modules', 'dep.js');
     linkSync(cache, linked);
-    expect(gateFor(linked).actionCategory).toBe('write_data');
+    // execute_command since #558, not write_data: this is installed package
+    // code inside a site project, which the daemon's `make dev` child imports
+    // on its next reload, and `write_file` now asks the site classifier about
+    // a path in the projects dir (sites/project-exec-paths.ts). The subject of
+    // this test is what follows -- the replace-by-rename -- which is unchanged.
+    expect(gateFor(linked).actionCategory).toBe('execute_command');
     expect(await write('node_modules/dep.js', 'module.exports = 2;\n')).toContain('File written successfully');
     expect(readFileSync(linked, 'utf-8')).toBe('module.exports = 2;\n');
     expect(readFileSync(cache, 'utf-8')).toBe('module.exports = 1;\n');
@@ -490,6 +495,31 @@ function realProject(): string {
 }
 
 // ── (b) exec-on-write paths are rated execute_command ────────────────────────
+
+describe('the gate does not stall on a hostile path', () => {
+  test('a path of 200k trailing dots or spaces is judged in milliseconds', () => {
+    // `write_file`'s authorityGate calls execOnWrite on the model-chosen path
+    // before any approval or refusal, on the daemon's only thread, and nothing
+    // upstream caps a tool argument's length. With `/[. ]+$/` doing the
+    // trailing trim this took about 30 seconds -- a whole-daemon freeze from
+    // one tool call, repeatable, and cheaper for the caller than a page load.
+    for (const pad of ['.'.repeat(200_000), ' '.repeat(200_000), './'.repeat(100_000)]) {
+      const started = Date.now();
+      gateFor(`${pad}a`);
+      gateFor(`/tmp/${pad}a`);
+      expect(Date.now() - started).toBeLessThan(1_000);
+    }
+  });
+
+  test('and still trims what it is supposed to trim', () => {
+    // The linear scan must not change the answer: these are the Windows
+    // spellings the trim exists for.
+    expect(execOnWriteClass('/home/u/.bashrc.')).not.toBeNull();
+    expect(execOnWriteClass('/home/u/.bashrc ')).not.toBeNull();
+    expect(execOnWriteClass('/home/u/.bashrc::$DATA')).not.toBeNull();
+    expect(execOnWriteClass('/home/u/notes.txt')).toBeNull();
+  });
+});
 
 describe('write_file is rated execute_command for paths that run as code', () => {
   const EXEC_PATHS = [
