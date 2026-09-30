@@ -693,7 +693,14 @@ export class BrowserController {
     }
   }
 
-  /** Forget the last snapshot's elements, coordinates, document and world. */
+  /**
+   * Forget the last snapshot's elements, coordinates, document and ELEMENT
+   * world.
+   *
+   * Not the narration world: that one holds a geometry read and no element ref,
+   * it is keyed on its own loaderId and replaced on the next read, and it is
+   * not a snapshot artifact -- `forgetNarrationWorld` is its counterpart.
+   */
   private forgetSnapshotElements(): void {
     this.elementCoords.clear();
     this.elementInFrame.clear();
@@ -909,6 +916,229 @@ export class BrowserController {
       text: data.text,
       elements: cleanElements,
     };
+  }
+
+  /**
+   * Where the element the last snapshot called `elementId` sits in the
+   * viewport, or null when this controller never minted that id.
+   *
+   * This is the map `click()` dispatches from, and that is the whole point.
+   * The pebble narration has to preview the element the click will hit, and
+   * the only way to be sure of that is to read the click's own input. It used
+   * to re-run a `querySelectorAll` inside the page instead, with a narrower
+   * selector and 0-based indexing against these 1-based ids, so the pebble
+   * pointed at one control while the click took another -- and the narration
+   * is what the user reads before approving (#585). Two resolutions of one
+   * integer is the bug; there is now one.
+   *
+   * Null rather than a guess, for the reason `getCachedElementBounds` in
+   * actions/tools/desktop.ts already gives on the desktop half of the same
+   * narration: an id we did not mint names nothing, and whatever happens to
+   * sit at that index now is not it.
+   *
+   * A centre point, not a rect. Callers that want to draw something at the
+   * element get the same single point the mouse event goes to, so there is no
+   * second centre to compute and disagree over.
+   *
+   * NOT A COMPLETE ANSWER ON ITS OWN, and that changed under this PR: #592 put
+   * `refuseIfDocumentMoved` in front of `click`, `hover` and `type`, so those
+   * now refuse outright once the browser has left the document the ids were
+   * minted under, and `forgetSnapshotElements` drops the map on that path and
+   * on a failed snapshot. The map is still populated while a narration runs,
+   * because a narration resolves on the `tool_call` stream event and the tool
+   * runs after the stream finishes -- so reading this alone would fly the
+   * pebble confidently to a stale coordinate for an action that is about to
+   * refuse. `viewportScreenOrigin` is what closes that: it compares the
+   * document these ids belong to against the one on screen, in the frame-tree
+   * read it already performs, and answers 'moved' instead of an origin. The
+   * pair is the honest answer; this half is the coordinate only.
+   *
+   * `type()` reads this map too, but only as a MEMBERSHIP test -- the
+   * coordinate itself is unused there and the element's identity comes from the
+   * isolated-world ref the same snapshot stashed (`__jarvis_elements[id - 1]`).
+   * The coordinate-click fallback that used to make `type` a second reader of
+   * these numbers was deleted by #592, so a `browser_type` pointer marks where
+   * the reviewed element was while the typing reaches it through its ref; after
+   * a reflow within the same document those differ, which is the same trade the
+   * click makes and no worse than it.
+   */
+  snapshotElementPoint(elementId: number): { x: number; y: number } | null {
+    const coords = this.elementCoords.get(elementId);
+    return coords ? { x: coords.x, y: coords.y } : null;
+  }
+
+  /**
+   * The isolated world `viewportScreenOrigin` evaluates in, retired with its
+   * document. Only ever holds a geometry read, never an element lookup.
+   *
+   * The contextId is a PROMISE so that two narrations racing on a cache miss
+   * share one world. One message emitting two element-addressed tool calls is
+   * the ordinary parallel-tool shape, and each narration is a detached task;
+   * without this, both would mint a world and only the last would be kept,
+   * orphaning a V8 context for the life of the document every time.
+   */
+  private narrationWorld: { loaderId: string; contextId: Promise<number | null> } | null = null;
+
+  /**
+   * Drop the cached narration world, so the next read mints one.
+   *
+   * A counterpart to `forgetSnapshotElements` rather than a line inside it: the
+   * narration world is not a snapshot artifact, and the two are cleared
+   * together only where the CDP session itself goes away. Named so that the two
+   * cleanup sites call a pair of methods instead of repeating a pair of
+   * statements -- that duplication is what made this file conflict on the
+   * merge that landed #592.
+   */
+  private forgetNarrationWorld(): void {
+    this.narrationWorld = null;
+  }
+
+  /**
+   * The screen coordinate of the viewport's top-left corner. Null when nothing
+   * is connected or the read fails, and `'moved'` when the browser has left the
+   * document the last snapshot's ids were minted under.
+   *
+   * Only `snapshotElementPoint` says WHICH element; this says where the
+   * viewport is on the screen. It takes an `elementId` for ONE purpose -- to
+   * ask whether that id was minted inside a frame -- and `elementInFrame` is a
+   * membership test over the ids this controller already minted, exactly as
+   * `type()` uses the coordinate map. So nothing here can pick an element, pick
+   * a different one, or answer anything but yes or no; the geometry it returns
+   * is still the window's and never an element's.
+   *
+   * WHY THE DOCUMENT CHECK LIVES HERE. #592 made `click`, `hover` and `type`
+   * refuse once the document an id was minted under is no longer the one on
+   * screen, so a narration that only read the coordinate map would preview an
+   * action that is about to refuse -- the pebble flying confidently to a stale
+   * point under an unamended label. The sidecar's half already refuses the same
+   * cases (`BROWSER_SNAPSHOT_STALE`, sidecar/browser_element_point.go), so
+   * without this the local and remote narrations would disagree about the same
+   * page, which is #585's own complaint one level down.
+   *
+   * ALL THREE of `refuseIfDocumentMoved`'s document terms are mirrored, not
+   * just the main-frame one: an empty map, a main-frame loaderId change, a
+   * `file:` page, and -- the one most easily missed -- a FRAME digest change
+   * for an id that came from a subframe. A child document can commit while the
+   * main frame's loaderId never moves, so without that term a framed element
+   * after its frame reloaded would still get a confident pointer for a click
+   * that refuses. The fourth term, a frame-tree read that throws, is covered by
+   * this function's own catch returning null.
+   *
+   * Checked in THIS read rather than in a second one, because the read is
+   * already being made for the isolated world's frameId, and
+   * `refuseIfDocumentMoved`'s own rule applies: one mechanism that fails closed
+   * beats two that can disagree. The residual window between this read and the
+   * click is the one #592 already accepts, and its error direction is
+   * over-refusal.
+   *
+   * Read in an ISOLATED WORLD. The values are the browser's, but a page can
+   * install its own `screenX` getter on its main-world `window`, and this
+   * offset is added to narration coordinates ONLY -- the click never reads it.
+   * A page able to forge it could slide the pointer off the point the click
+   * takes, which is the same decoupling #585 is about, reintroduced one term
+   * later. An isolated world gets its own global proxy, so accessors the page
+   * installed do not apply.
+   *
+   * Never connects. A narration runs on the tool_call event, before the action
+   * it previews has executed, so it must not be the thing that launches a
+   * browser.
+   *
+   * `screenY + (outerHeight - innerHeight)` is the viewport origin. The old
+   * narration added `screenY` alone, which is the top of the title bar, so
+   * every pointer landed roughly a toolbar height above the element. The
+   * subtraction is the chrome height at 100% page zoom: Chromium reports
+   * `outerHeight` and `screenY` in device-independent pixels while
+   * `innerHeight` follows the page zoom, so a zoomed page over-reports it --
+   * as does devtools docked at the bottom of the window, for the same reason.
+   * Verified at zoom 1 only; `Page.getLayoutMetrics` would give the ratio
+   * outright and is the way to remove the guess.
+   *
+   * NOT scaled to device pixels, deliberately. The pebble is positioned in
+   * whatever space its platform reads the cursor in, and that is not one
+   * space: Cocoa points on macOS (sidecar/panels_darwin.go, `[NSEvent
+   * mouseLocation]`), GDK logical pixels on Linux (panels_linux.go,
+   * `gdk_device_get_position`), physical pixels on Windows (panels_windows.go,
+   * `GetCursorPos` under PerMonitorV2). A `devicePixelRatio` multiply is right
+   * only on the third, and on the other two it would scale an absolute screen
+   * coordinate -- throwing the pebble most of a screen away rather than a
+   * toolbar. So this returns the CSS-pixel position unscaled, which is what
+   * the code it replaces effectively did, and the CSS-to-platform conversion
+   * stays an open, measurable question rather than an unverified multiply.
+   */
+  async viewportScreenOrigin(elementId: number): Promise<{ x: number; y: number } | 'moved' | null> {
+    if (!this._connected) return null;
+    try {
+      const tree = await this.cdp.send('Page.getFrameTree');
+      const frameId = tree?.frameTree?.frame?.id;
+      const loaderId = String(tree?.frameTree?.frame?.loaderId ?? '');
+      if (typeof frameId !== 'string' || !frameId || !loaderId) return null;
+      // Read off the SAME tree, so the three checks below cannot disagree with
+      // each other. `readFrameState` is not reused here on purpose: it writes
+      // `lastReportedUrl`, and a cosmetic narration must not move state the
+      // action path reads.
+      const url = String(tree?.frameTree?.frame?.url ?? '');
+      const frameStamp = frameTreeStamp(tree?.frameTree);
+      // The snapshot's ids describe one document. An empty `elementDoc` is the
+      // same answer as a mismatched one: nothing reviewed is on screen, so
+      // there is no point to preview.
+      if (!this.elementDoc.loaderId || loaderId !== this.elementDoc.loaderId) return 'moved';
+      // The browser does not drive local files, so the action will refuse here
+      // too. The URL itself is never returned or logged from this path.
+      if (isLocalContentUrl(url)) return 'moved';
+      // A subframe can commit a new document while the main frame's loaderId
+      // never moves, which leaves an in-frame coordinate describing a document
+      // that no longer exists. Scoped to in-frame ids, matching the action: an
+      // unrelated advertising iframe reloading must not cost a main-document
+      // element its pointer.
+      if (this.elementInFrame.has(elementId) && frameStamp !== this.elementDoc.frameStamp) {
+        return 'moved';
+      }
+      // One isolated world per document, not per narration: createIsolatedWorld
+      // mints a fresh world (and a fresh V8 context) on every call however the
+      // name is reused, and nothing disposes them. The loaderId changes on
+      // every commit, so keying on it retires the world with its document.
+      if (this.narrationWorld?.loaderId !== loaderId) {
+        this.narrationWorld = {
+          loaderId,
+          contextId: this.cdp.send('Page.createIsolatedWorld', {
+            frameId,
+            worldName: 'jarvis-narration',
+          }).then((world) => {
+            const id = world?.executionContextId;
+            return typeof id === 'number' ? id : null;
+          }).catch(() => null),
+        };
+      }
+      const contextId = await this.narrationWorld.contextId;
+      if (contextId === null) {
+        this.narrationWorld = null;
+        return null;
+      }
+      const result = await this.cdp.send('Runtime.evaluate', {
+        expression: `({
+          x: window.screenX || 0,
+          y: (window.screenY || 0) + Math.max(0, (window.outerHeight || 0) - (window.innerHeight || 0)),
+        })`,
+        contextId,
+        returnByValue: true,
+      });
+      if (result?.exceptionDetails) {
+        this.narrationWorld = null;
+        return null;
+      }
+      const value = result?.result?.value as { x?: unknown; y?: unknown } | undefined;
+      const x = Number(value?.x);
+      const y = Number(value?.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      return { x, y };
+    } catch {
+      // A narration that cannot be placed says so (the caller amends the
+      // bubble); it does not fall back to a coordinate it cannot stand behind.
+      // Drop the cached world too -- a context that just failed is the most
+      // likely thing to have gone away.
+      this.narrationWorld = null;
+      return null;
+    }
   }
 
   /**
@@ -1452,6 +1682,7 @@ export class BrowserController {
       await this.cdp.close();
       this._connected = false;
       this.forgetSnapshotElements();
+      this.forgetNarrationWorld();
       console.log('[BrowserController] Disconnected');
     }
 
@@ -1484,6 +1715,7 @@ export class BrowserController {
       await this.cdp.close();
       this._connected = false;
       this.forgetSnapshotElements();
+      this.forgetNarrationWorld();
     }
 
     if (!this._connected) {

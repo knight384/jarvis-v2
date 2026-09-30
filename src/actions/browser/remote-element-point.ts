@@ -7,8 +7,8 @@
  * reviewers agreed, but it meant the pointer went quiet on almost every
  * install, because `CapBrowser` is in the sidecar's DEFAULT capability set
  * (`sidecar/config.go`): the click routes to the sidecar, its coordinates live
- * in that process's own Go map, and nothing carried them back. PR #590 is held
- * in draft for exactly that. This module is the other half.
+ * in that process's own Go map, and nothing carried them back. This module is
+ * the other half, and #590 is wired to it.
  *
  * ONE RULE, inherited from `src/daemon/pebble-narration.ts` and not weakened
  * here: a narration reads the coordinates the ACTION will use, and never
@@ -28,36 +28,25 @@
  *     tool runs after the stream finishes, so a live inventory read here is
  *     resolved at a different instant than the one the tool will use.
  *
- * WHERE THIS IS WIRED. #590 owns the narration call site
- * (`resolveToolNarration` in `src/daemon/index.ts`) and its
- * `browserElementNarration`, neither of which is on main yet. So this module
- * ships as the functions plus their tests, and the wiring is applied when #590
- * rebases onto it. That is THREE edits in TWO files #590 owns, not a one-line
- * drop-in -- stated exactly, because an under-described handoff is how the
- * rebase silently keeps the fail-closed branch:
+ * WHERE THIS IS WIRED, past tense: #590 applied the handoff. The dep is
+ * `BrowserNarrationDeps.remoteElementPoint` (src/daemon/pebble-narration.ts),
+ * it is consumed INSIDE `browserElementNarration`'s `!localBrowserWillServe()`
+ * check -- inside, never after, so `deps.snapshotElementPoint` stays
+ * unreachable for a remote browser -- and `resolveToolNarration`
+ * (src/daemon/index.ts) builds it from one routing object per narration. That
+ * placement is the load-bearing part; see `browserElementNarration` for why it
+ * is structural rather than a convention.
  *
- *   1. `BrowserNarrationDeps` (src/daemon/pebble-narration.ts) gains
+ * The two type claims that made it fit were checked rather than assumed, and
+ * both held with no adapter and no cast: `NarrationRouting` satisfies
+ * `RemotePointRouting` structurally, and `RemoteElementPoint` is assignable to
+ * `PebbleNarration`.
  *
- *        readonly remoteElementPoint?: (elementId: number) => Promise<PebbleNarration>;
- *
- *   2. in `browserElementNarration`, REPLACING the early return in the
- *      existing `!localBrowserWillServe()` check -- inside it, never after it,
- *      so `deps.snapshotElementPoint` stays unreachable for a remote browser:
- *
- *        if (!deps.localBrowserWillServe()) {
- *          return deps.remoteElementPoint
- *            ? await deps.remoteElementPoint(id)
- *            : { kind: 'unplaced', reason: 'the browser serving this call is not the local one' };
- *        }
- *
- *   3. in `resolveToolNarration`'s browser branch, beside the other deps:
- *
- *        remoteElementPoint: (id) => remoteBrowserNarration(narrationRouting(sidecarId, args), id),
- *
- * The two type claims that make that fit are checked rather than assumed:
- * #590's `NarrationRouting` satisfies `RemotePointRouting` structurally with no
- * conversion, and `RemoteElementPoint` is assignable to its `PebbleNarration`,
- * so neither an adapter nor a cast is needed.
+ * The dep stays OPTIONAL although the one production caller always supplies it.
+ * That keeps this module out of the narration's hard dependencies -- a
+ * narration is cosmetic and runs before the action it previews is approved, so
+ * `pebble-narration.ts` must stay a pure decision over its inputs, with the
+ * fail-closed answer reachable and unit-testable without a sidecar at all.
  */
 
 import { routeBrowserElementPointToSidecar, type ElementPointRefusal } from '../tools/sidecar-route.ts';
