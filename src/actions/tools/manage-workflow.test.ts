@@ -1,3 +1,5 @@
+import { configureWorkflowReadiness } from '../../workflows/db/repos/flow-readiness';
+import { PieceCatalog } from '../../workflows/runtime/piece-catalog';
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -29,6 +31,9 @@ class StubLlm implements ComposerLlmClient {
 
 beforeEach(() => {
   initWorkflowDb(":memory:");
+  configureWorkflowReadiness({ tool: name => name === "desktop_launch_app" ? { params: [{ name: "executable", type: "string", required: true }] } : null, pieces: new PieceCatalog([...sampleCatalog().list(),
+    { name: 'jarvis-tool', displayName: '', description: '', actions: { invoke: { name: 'invoke', displayName: '', description: '' } } },
+  ]) });
 });
 
 afterEach(() => {
