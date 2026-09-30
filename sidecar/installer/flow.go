@@ -7,17 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
-)
 
-// minBundledSidecarVersion is the first sidecar release whose darwin npm
-// package ships the Jarvis.app bundle rather than a bare binary. Earlier
-// packages cannot be installed: macOS notifications are unavailable to a bare
-// binary, and TCC grants bind to a bundle identity, so installing one would
-// produce a sidecar that silently cannot notify or hold permissions.
-const minBundledSidecarVersion = "0.9.1"
+	"github.com/jarvis/sidecar/internal/update"
+)
 
 // minSetupSidecarVersion is the first sidecar release whose flag.Parse knows
 // --setup. Older sidecars hard-exit on unknown flags with a dead stderr under
@@ -94,18 +87,18 @@ func performInstall(registryURL string, silent bool, progress progressFn) instal
 	// and that row is not the place for a number the user did not pick. The
 	// console path still names the resolved version on its final line.
 	progress("download", "Downloading the latest sidecar…")
-	tgz, err := downloadTarball(rel, workDir)
+	tgz, err := update.Download(rel, workDir)
 	if err != nil {
 		return fail(exitNetwork, err)
 	}
 
 	progress("verify", "Verifying the payload (sha512 + code signature)…")
 	staged := filepath.Join(workDir, "staged")
-	if err := extractPayload(tgz, staged); err != nil {
+	if err := update.Extract(tgz, staged); err != nil {
 		// Guard violations mean the payload is untrustworthy (3); local I/O
 		// failures (disk full, permissions) are filesystem errors (5). The
 		// exit codes are a frozen contract, so don't conflate them.
-		var rej errPayloadRejected
+		var rej update.PayloadRejectedError
 		if errors.As(err, &rej) {
 			return fail(exitVerification, fmt.Errorf("payload rejected: %w", err))
 		}
@@ -115,10 +108,10 @@ func performInstall(registryURL string, silent bool, progress progressFn) instal
 	// Layout before signature: a package that predates the current layout would
 	// otherwise surface as "code-signature verification failed", sending the
 	// reader after a signing problem that does not exist.
-	if err := checkPayloadLayout(stagedBin, rel.Version); err != nil {
+	if err := update.CheckPayloadLayout(stagedBin, rel.Version); err != nil {
 		return fail(exitVerification, err)
 	}
-	if err := verifyPayloadSignature(stagedBin); err != nil {
+	if err := update.VerifyPayloadSignature(stagedBin); err != nil {
 		return fail(exitVerification, fmt.Errorf("code-signature verification failed (refusing to install an unverified sidecar): %w", err))
 	}
 
@@ -134,12 +127,17 @@ func performInstall(registryURL string, silent bool, progress progressFn) instal
 		}
 	}
 	progress("install", fmt.Sprintf("Installing to %s…", installDir))
-	if err := swapInstall(stagedBin, installDir); err != nil {
+	if err := update.Swap(stagedBin, installDir); err != nil {
 		return fail(exitFilesystem, fmt.Errorf("install failed: %w", err))
+	}
+	// The running sidecar was stopped above, so nothing needs the previous
+	// copy for a rollback.
+	if err := update.CleanupOld(installDir); err != nil {
+		logf("warning: could not remove the previous copy: %v", err)
 	}
 	out.InstallDir = installDir
 
-	if got, err := installedBinaryVersion(installDir); err != nil {
+	if got, err := update.InstalledBinaryVersion(installDir); err != nil {
 		logf("warning: post-install version check failed: %v", err)
 	} else if got != rel.Version {
 		logf("warning: installed binary reports %q, expected %q", got, rel.Version)
@@ -186,19 +184,6 @@ func runInstall(registryURL string, silent, noLaunch, autostartOn bool) int {
 	return exitOK
 }
 
-// execCommandOutput runs a command and returns its trimmed stdout. Console
-// windows are suppressed: the installer is built -H windowsgui, so an
-// unhidden child would flash a black console at the user.
-func execCommandOutput(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	hideSubprocessWindow(cmd)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 // shouldApplyAutostart reports whether this run may touch the login-item
 // registration. FIRST INSTALL ONLY: the sidecar never clears its Run value
 // when the preference is off, so re-applying on an update would silently
@@ -212,27 +197,4 @@ func shouldApplyAutostart(out installOutcome) bool {
 // releases die on unknown flags.
 func setupHandoffAllowed(version string) bool {
 	return !versionLess(version, minSetupSidecarVersion)
-}
-
-// sidecarPackageManager positively identifies a global bun- or npm-managed
-// @usejarvis/sidecar and names its owner ("bun" or "npm"; "" when neither has
-// it). We defer to the package manager instead of installing alongside it.
-func sidecarPackageManager() string {
-	if home, err := os.UserHomeDir(); err == nil &&
-		hasSidecarPackage(filepath.Join(home, ".bun", "install", "global", "node_modules")) {
-		return "bun"
-	}
-	if root, err := execCommandOutput("npm", "root", "-g"); err == nil && root != "" && hasSidecarPackage(root) {
-		return "npm"
-	}
-	return ""
-}
-
-// hasSidecarPackage reports whether a global node_modules tree holds the
-// package. It wants the package's package.json, not just its directory: a
-// folder left behind by an uninstall would otherwise refuse the native install
-// for good, with nothing on the screen saying why.
-func hasSidecarPackage(nodeModules string) bool {
-	fi, err := os.Stat(filepath.Join(nodeModules, "@usejarvis", "sidecar", "package.json"))
-	return err == nil && !fi.IsDir()
 }

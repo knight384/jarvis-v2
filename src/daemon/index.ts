@@ -52,7 +52,7 @@ import { ApprovalManager } from "../authority/approval.ts";
 import { AuditTrail } from "../authority/audit.ts";
 import { impactFromCategory } from "../roles/authority.ts";
 import { wrapUntrusted, inlineUntrusted } from "../roles/untrusted.ts";
-import { SIDECAR_RECOMMENDED_VERSION } from "../sidecar/compat.ts";
+import { isUpdateAvailable, SIDECAR_LATEST_VERSION, SIDECAR_RECOMMENDED_VERSION } from "../sidecar/compat.ts";
 import { containsWakePhrase, hasSpokenContent, wakeCommandFrom } from "../voice/wake-phrase.ts";
 import { AuthorityLearner } from "../authority/learning.ts";
 import { EmergencyController } from "../authority/emergency.ts";
@@ -4610,8 +4610,8 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // Jarvis" only; the founder opted to allow Approve/Deny on every approval
     // notification (the impact still shows in the body's meta as a risk cue).
     // All four reasons are wired: approval, done (an approved action finished),
-    // sidecar-offline, and update (a connecting sidecar below the recommended
-    // version — the compat verdict already on the ConnectedSidecar).
+    // sidecar-offline, and update (a connecting sidecar that is behind and
+    // cannot update itself; see the onSidecarConnected handler below).
     const notifyAll = (payload: Record<string, unknown>): void => {
       for (const sc of sidecarManager.getConnectedSidecars()) {
         void sidecarManager.dispatchRPC(sc.id, 'notify.show', payload).catch(() => {});
@@ -4688,23 +4688,31 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
     // A machine dropped → tell the other connected sidecars. Keep a name map so
     // the body can say which machine (the sidecar object is gone by disconnect).
-    // On connect we also fire the "update" notification when the sidecar's
-    // version verdict is 'suggested' (below SIDECAR_RECOMMENDED_VERSION) — the
-    // honest, already-computed signal for the fourth reason. Sent only to that
-    // machine, deduped per (id, version) so a reconnect flap can't nag.
+    // On connect we also fire the "update" notification when the sidecar is
+    // behind: below SIDECAR_RECOMMENDED_VERSION ('suggested'), or behind the
+    // sidecar this brain ships with. Only for sidecars that predate
+    // self-update (no update_* feature): newer ones prompt natively at
+    // startup or get the dashboard hint, and a second nudge would be noise.
+    // Sent only to that machine, deduped per (id, version) for this brain
+    // process so a reconnect flap can't nag.
     const sidecarNameById = new Map<string, string>();
     const notifiedUpdateKeys = new Set<string>();
     sidecarManager.onSidecarConnected((sc) => {
       sidecarNameById.set(sc.id, sc.name);
-      if (sc.updateStatus === 'suggested') {
+      const behind = sc.updateStatus === 'suggested' || isUpdateAvailable(sc.version);
+      const selfUpdating = sc.features?.some((f) => f === 'update_prompt' || f === 'update_apply') ?? false;
+      if (behind && !selfUpdating) {
         const key = `${sc.id}:${sc.version}`;
         if (!notifiedUpdateKeys.has(key)) {
           notifiedUpdateKeys.add(key);
+          const target = sc.updateStatus === 'suggested' && !isUpdateAvailable(sc.version)
+            ? `${SIDECAR_RECOMMENDED_VERSION} is recommended`
+            : `${SIDECAR_LATEST_VERSION} is available`;
           void sidecarManager.dispatchRPC(sc.id, 'notify.show', {
             id: `update:${sc.id}`,
             kind: 'update',
             title: 'Update Jarvis',
-            body: `This machine is on ${sc.version}; ${SIDECAR_RECOMMENDED_VERSION} is recommended.`,
+            body: `This machine is on ${sc.version}; ${target}.`,
             destructive: false,
             actions: [
               { id: 'review', label: 'Open Jarvis', primary: true },
@@ -5961,11 +5969,15 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     // typed into. They are consumed by the recorder listener alone; a
     // dashboard broadcast or a coalescer slot would bypass its redaction.
     const recorderEventTypes = ['ui_interaction', 'ui_recording'];
+    // Self-update progress is bookkeeping the sidecar manager records on the
+    // connection (surfaced through /api/sidecars); it is not an observation.
+    const internalSidecarEventTypes = ['update_progress'];
 
     sidecarManager.onEvent((sidecarId, event) => {
       // Skip events already routed to awareness service to avoid double processing
       if (awarenessService && awarenessEventTypes.includes(event.event_type)) return;
       if (recorderEventTypes.includes(event.event_type)) return;
+      if (internalSidecarEventTypes.includes(event.event_type)) return;
 
       const payloadObj: Record<string, unknown> =
         typeof event.payload === 'object' && event.payload !== null

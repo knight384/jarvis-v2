@@ -1,7 +1,8 @@
-package main
+package update
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -91,9 +92,9 @@ func compareSemver(a, b semver) int {
 	return 0
 }
 
-// versionLess reports a < b for two version strings; parse failures make the
+// VersionLess reports a < b for two version strings; parse failures make the
 // unparseable side lose (so a weird installed version still updates).
-func versionLess(a, b string) bool {
+func VersionLess(a, b string) bool {
 	av, aerr := parseSemver(a)
 	bv, berr := parseSemver(b)
 	if aerr != nil {
@@ -103,4 +104,39 @@ func versionLess(a, b string) bool {
 		return false
 	}
 	return compareSemver(av, bv) < 0
+}
+
+// StrictlyNewer reports candidate > current with BOTH sides parseable. It is
+// the self-update gate, so unlike VersionLess it never lets an unparseable
+// side through: a "dev" build is never updated, and a garbage candidate is
+// never installed.
+func StrictlyNewer(candidate, current string) bool {
+	if !ValidVersion(candidate) {
+		return false
+	}
+	cv, cerr := parseSemver(candidate)
+	rv, rerr := parseSemver(current)
+	if cerr != nil || rerr != nil {
+		return false
+	}
+	return compareSemver(cv, rv) > 0
+}
+
+// canonicalVersionRe is the exact form a published sidecar version takes:
+// MAJOR.MINOR.PATCH with an optional prerelease, no "v", no build metadata,
+// no whitespace. parseSemver is deliberately looser (it reads whatever an
+// installed binary reports); anything used as a registry key or a package
+// spec must be canonical.
+var canonicalVersionRe = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
+
+// ValidVersion reports whether v is a canonical release or prerelease
+// version; "dev" and other unstamped builds are not.
+func ValidVersion(v string) bool {
+	return canonicalVersionRe.MatchString(v)
+}
+
+// IsPrerelease reports whether v carries a prerelease tag (1.2.3-rc.1).
+func IsPrerelease(v string) bool {
+	sv, err := parseSemver(v)
+	return err == nil && sv.pre != ""
 }
