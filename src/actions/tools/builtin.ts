@@ -761,19 +761,160 @@ export const getSystemInfoTool: ToolDefinition = {
 
 // --- Browser Tool Helpers ---
 
+// Formatter limits — keep in sync with sidecar/browser_snapshot.go.
+//
+// EVERY limit here counts CODE POINTS (`Array.from`), not UTF-16 units and not
+// bytes (#597). `.slice`/`.length` are UTF-16 units while the sidecar's port
+// sliced the same fields by BYTES, so the two formatters disagreed about the
+// same page the moment it was not ASCII -- and either counting can cut a
+// character in half, which reaches the model as a lone surrogate or a U+FFFD.
+// sidecar/testdata/snapshot_parity_expected.txt is the golden rendering both
+// sides are held to, by a Go test and by snapshot-format-parity.test.ts.
 const MAX_PAGE_TEXT = 2000;   // chars of visible page text
 const MAX_ELEMENTS = 80;      // interactive elements shown to LLM
 const MAX_SAME_ROLE = 15;     // max elements with the same role (e.g., gridcell)
+const MAX_ELEMENT_TEXT = 50;  // chars of an element's own text
+const MAX_ELEMENT_HREF = 80;  // chars of an href
+// Attribute values, and the Key Elements labels built from them. The snapshot
+// script already cuts every attribute at 200 UTF-16 units (never more than 200
+// code points), so this is a bound the formatter holds on its own rather than a
+// second cut of the same value.
+const MAX_ELEMENT_ATTR = 200;
 
-function formatSnapshot(snap: PageSnapshot): string {
+/**
+ * Caps for the two lines a PAGE writes into the rendered snapshot (#597).
+ *
+ * `Page:` is `document.title` and `URL:` is `location.href`, both chosen by the
+ * page and both previously uncapped. Remotely that dropped the whole read at
+ * the brain's 2 MB event cap with no error anywhere; locally it spent the
+ * model's context on a page's choice of padding. Everything else rendered here
+ * is already bounded (page text, 80 elements, 200 chars per attribute from the
+ * snapshot script), so these two lines were the whole exposure.
+ *
+ * Truncated, not refused -- the opposite of what #594 does to the identity
+ * fields, and for the opposite reason: those are branched on, where a shortened
+ * URL names a different page; these are prose the model reads, where a
+ * shortened title beats a dropped snapshot. Marked visibly either way.
+ *
+ * Two numbers: 2048 is generous for a title and too small for a URL the model
+ * copies back into browser_navigate (Maps polylines, OAuth callbacks). The URL
+ * cap matches the sidecar's `maxWirePageURL`, so a URL that survives the wire
+ * is not cut in the text.
+ */
+const MAX_RENDERED_TITLE = 2048;
+const MAX_RENDERED_URL = 4096;
+/**
+ * Everything else a page chooses that a browser reply then carries: a
+ * `browser_evaluate` result and the message a thrown Error fills. Same failure,
+ * same marker, a bigger number because the model asks `browser_evaluate` for a
+ * value rather than for prose. `maxPageControlledReply` in the sidecar.
+ */
+const MAX_PAGE_CONTROLLED_REPLY = 20000;
+
+/**
+ * Cut a page-controlled line for the rendering and say so in place.
+ *
+ * The marker joins the SAME line, directly after the value, with no leading
+ * space, and reuses the grammar and quantity the page-text cut already uses
+ * (characters REMOVED). `truncateRendered` in sidecar/browser_snapshot.go is
+ * this function; the golden parity test fails if the two ever word it
+ * differently.
+ */
+function truncateMarked(value: string, limit: number): string {
+  if (limit <= 0) return '';
+  const chars = Array.from(value);
+  if (chars.length <= limit) return value;
+  return `${chars.slice(0, limit).join('')}... (${chars.length - limit} chars truncated)`;
+}
+
+/**
+ * `truncateMarked` for a value that must also be ONE LINE: the `Page:` and
+ * `URL:` lines. The count is taken after the strip, so it reports what was cut
+ * from the one-line value rather than from the page's original.
+ *
+ * Deliberately NOT used for a `browser_evaluate` result or an error blob: those
+ * are legitimately multi-line, and stripping them would glue every line of a
+ * document together - a change to what the model reads with nothing to do with
+ * capping it.
+ */
+function truncateRendered(value: string, limit: number): string {
+  return truncateMarked(stripControlChars(value), limit);
+}
+
+/**
+ * Prepare a page-controlled value for a single LINE of the rendering: control
+ * characters out, then cut to `limit` code points.
+ *
+ * The strip is the rule the sidecar's `truncateURL` applies, for the same
+ * reason. These fields are single-line BY CONSTRUCTION - a title, a label, an
+ * element's collapsed text - so a newline in one is a page writing a line of
+ * the rendering: a title containing a newline plus "URL: ..." produced a
+ * second, forged `URL:` line, and an `aria-label` carrying a newline forged an
+ * element line, inside a block whose every line the model reads as ours.
+ *
+ * SCOPE, stated because it is easy to over-read. It covers the title, the URL
+ * line, the attributes and the element text, and only the C0 range plus DEL:
+ * U+0085, U+2028 and U+2029 survive, so a consumer that treats those as line
+ * breaks sees more lines than the formatter wrote. That is deliberate - both
+ * formatters emit them identically, so removing them would be a second rule to
+ * keep in step for a reader nothing here has - and the `--- Page Text ---`
+ * block is legitimately multi-line and is not stripped at all, so a page can
+ * still put something that reads like a section header or an `[id]` line into
+ * its own body text. Nothing escapes the untrusted block either way; what this
+ * buys is that the lines the FORMATTER writes are the formatter's.
+ *
+ * `renderedValue` in sidecar/browser_snapshot.go is this function.
+ */
+function renderedValue(value: string, limit: number): string {
+  const chars = Array.from(stripControlChars(value));
+  return chars.length <= limit ? chars.join('') : chars.slice(0, limit).join('');
+}
+
+/**
+ * Replace every run of C0 controls and DEL with ONE space.
+ *
+ * Replaced rather than deleted, and that matters: a multi-line
+ * `aria-label="Send\nnow"` is ordinary authoring, and deleting the newline
+ * glues the words into "Sendnow". A space is also what the snapshot script
+ * already does to the whitespace it collapses, so this is the same rule
+ * reaching the characters that rule does not match. Only runs of CONTROL
+ * characters collapse: a value with no control character comes back unchanged.
+ *
+ * `stripControlChars` in sidecar/browser_snapshot.go is this function.
+ */
+function stripControlChars(value: string): string {
+  let out = '';
+  let inRun = false;
+  for (const ch of value) {
+    const code = ch.codePointAt(0)!;
+    if (code < 0x20 || code === 0x7f) {
+      if (!inRun) { out += ' '; inRun = true; }
+      continue;
+    }
+    inRun = false;
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * The LLM-facing rendering of a snapshot.
+ *
+ * Exported for `snapshot-format-parity.test.ts` only, which renders the same
+ * input through this and through the Go formatter's golden output and compares
+ * them byte for byte. #592 kept this text byte-identical because all 100
+ * webapp-templates are written against it; nothing but a test should call this.
+ */
+export function formatSnapshot(snap: PageSnapshot): string {
   const lines: string[] = [];
-  lines.push(`Page: ${snap.title}`);
-  lines.push(`URL: ${snap.url}`);
+  lines.push(`Page: ${truncateRendered(snap.title, MAX_RENDERED_TITLE)}`);
+  lines.push(`URL: ${truncateRendered(snap.url, MAX_RENDERED_URL)}`);
   lines.push('');
   lines.push('--- Page Text ---');
-  lines.push(snap.text.slice(0, MAX_PAGE_TEXT));
-  if (snap.text.length > MAX_PAGE_TEXT) {
-    lines.push(`... (${snap.text.length - MAX_PAGE_TEXT} chars truncated)`);
+  const text = Array.from(snap.text);
+  lines.push(text.length > MAX_PAGE_TEXT ? text.slice(0, MAX_PAGE_TEXT).join('') : snap.text);
+  if (text.length > MAX_PAGE_TEXT) {
+    lines.push(`... (${text.length - MAX_PAGE_TEXT} chars truncated)`);
   }
   lines.push('');
 
@@ -834,10 +975,10 @@ function formatSnapshot(snap: PageSnapshot): string {
       lines.push('--- Key Elements ---');
       for (const el of keyInputs) {
         const label = el.attrs['aria-label'] || el.attrs.placeholder || el.attrs.name || el.tag;
-        lines.push(`[${el.id}] INPUT: ${label}${el.attrs.contenteditable ? ' (contenteditable)' : ''}`);
+        lines.push(`[${el.id}] INPUT: ${renderedValue(label, MAX_ELEMENT_ATTR)}${el.attrs.contenteditable ? ' (contenteditable)' : ''}`);
       }
       for (const el of keyButtons) {
-        lines.push(`[${el.id}] BUTTON: ${el.attrs['aria-label']}`);
+        lines.push(`[${el.id}] BUTTON: ${renderedValue(el.attrs['aria-label']!, MAX_ELEMENT_ATTR)}`);
       }
       lines.push('');
     }
@@ -845,17 +986,18 @@ function formatSnapshot(snap: PageSnapshot): string {
     lines.push(`--- Interactive Elements (${shown.length}/${snap.elements.length}) ---`);
     for (const el of shown) {
       const attrParts: string[] = [];
-      if (el.attrs.name) attrParts.push(`name="${el.attrs.name}"`);
-      if (el.attrs.placeholder) attrParts.push(`placeholder="${el.attrs.placeholder}"`);
-      if (el.attrs.type) attrParts.push(`type="${el.attrs.type}"`);
-      if (el.attrs.href) attrParts.push(`href="${el.attrs.href.slice(0, 80)}"`);
-      if (el.attrs['aria-label']) attrParts.push(`aria-label="${el.attrs['aria-label']}"`);
-      if (el.attrs.role) attrParts.push(`role="${el.attrs.role}"`);
-      if (el.attrs.contenteditable) attrParts.push(`contenteditable="${el.attrs.contenteditable}"`);
-      if (el.attrs['data-testid']) attrParts.push(`data-testid="${el.attrs['data-testid']}"`);
-      if (el.attrs.iframe) attrParts.push(`iframe="${el.attrs.iframe}"`);
+      const attr = (key: string) => renderedValue(el.attrs[key]!, MAX_ELEMENT_ATTR);
+      if (el.attrs.name) attrParts.push(`name="${attr('name')}"`);
+      if (el.attrs.placeholder) attrParts.push(`placeholder="${attr('placeholder')}"`);
+      if (el.attrs.type) attrParts.push(`type="${attr('type')}"`);
+      if (el.attrs.href) attrParts.push(`href="${renderedValue(el.attrs.href, MAX_ELEMENT_HREF)}"`);
+      if (el.attrs['aria-label']) attrParts.push(`aria-label="${attr('aria-label')}"`);
+      if (el.attrs.role) attrParts.push(`role="${attr('role')}"`);
+      if (el.attrs.contenteditable) attrParts.push(`contenteditable="${attr('contenteditable')}"`);
+      if (el.attrs['data-testid']) attrParts.push(`data-testid="${attr('data-testid')}"`);
+      if (el.attrs.iframe) attrParts.push(`iframe="${attr('iframe')}"`);
 
-      const textStr = el.text ? ` "${el.text.slice(0, 50)}"` : '';
+      const textStr = el.text ? ` ${JSON.stringify(renderedValue(el.text, MAX_ELEMENT_TEXT))}` : '';
       const attrStr = attrParts.length > 0 ? ' ' + attrParts.join(' ') : '';
       lines.push(`[${el.id}] ${el.tag}${textStr}${attrStr}`);
     }
@@ -877,6 +1019,94 @@ function formatSnapshot(snap: PageSnapshot): string {
  */
 function resolveBrowserTarget(params: Record<string, unknown>, tool: string): string | null {
   return resolveToolTarget(params.target, 'browser', tool);
+}
+
+/**
+ * Bind a reviewed browser call to the surface it was reviewed on (#602).
+ *
+ * #495 bound an approval to the reviewed snapshot so that what the user
+ * approved is what happens, and `createBrowserTools` -- the background agent's
+ * set -- sets a guard on every one of its tools. The main registry set one only
+ * on `browser_upload_file`, and `ApprovalManager.createRequest` falls back to
+ * `() => true` when a gated tool has none, so `browser_click`, `browser_type`
+ * and `browser_hover` had no binding at all: exactly the tools that act on the
+ * reviewed surface.
+ *
+ * THE ASYMMETRY WAS NOT A COPY-PASTE OMISSION, which is why this is not the
+ * background set's guard. Every tool there is bound to one `BrowserController`
+ * and can only run locally. These tools are dual-routed: when
+ * `resolveBrowserTarget` finds a sidecar -- named in `target`, or chosen by
+ * `autoTargetForCapability` with nothing named -- the call runs on THAT
+ * browser, and the local controller's epoch says nothing about it. On a
+ * sidecar-only machine the local controller is never connected, so the
+ * background set's guard would refuse every remote browser call outright.
+ *
+ * So the routing decision is made ONCE, here, at review time -- the same
+ * moment and the same async context the tool would have resolved it in -- and
+ * never again from inside the returned closure. Re-resolving at execution time
+ * would read a live sidecar inventory minutes or hours later, and through an
+ * `AsyncLocalStorage` machine scope that is absent on the deferred executor's
+ * context, so the two answers could differ with nothing having changed. (The
+ * same reasoning `pebble-narration.ts` gives for not calling the router off the
+ * tool path.) A router that throws degrades to the unbound guard rather than to
+ * a dead approval: `execute` will refuse the call itself, with a reason.
+ *
+ * REMAINING GAP, deliberate and recorded: a reviewed REMOTE call is still
+ * unbound. The sidecar has its own `elemGen` and its own document checks at use
+ * time, but nothing in this process can read them synchronously, and the
+ * arguments -- including `target` -- are already compared byte for byte by
+ * `getUiExecutionRegistry`.
+ */
+function browserCallGuard(
+  tool: string,
+  opts: { bindDocument?: boolean } = {},
+): (params: Record<string, unknown>) => (() => boolean) {
+  return (params) => {
+    let reviewedRoute: string | null;
+    try {
+      reviewedRoute = resolveBrowserTarget(params, tool);
+    } catch {
+      // Fails CLOSED, matching `createRequest`'s own catch ("a failed subject
+      // capture must not create an executable approval"). The only thing that
+      // throws here is a MachineScope refusing the dispatch, and the deferred
+      // executor carries no scope -- so `execute` would re-resolve without the
+      // fence and run the call the scope refused.
+      return () => false;
+    }
+    // A LAZY CONNECTION IS NOT A MISSING SURFACE. `navigate`, `scroll`,
+    // `press_key` and `evaluate` all start with `ensureConnected` and need no
+    // prior snapshot, so on a cold daemon they are reviewed with nothing
+    // connected and connect when they run. Requiring a live connection at
+    // review for those produced a card that was already dead: the user clicked
+    // Approve and got "its original UI session or reviewed subject is no
+    // longer available" for a call that would have worked. The
+    // element-addressed tools are the opposite -- they cannot work without the
+    // snapshot that minted their ids, so for them a cold browser at review
+    // really does mean nothing was reviewed.
+    const mayConnectLazily = !opts.bindDocument;
+    const local = reviewedRoute ? null : browser.captureApprovalGuard(mayConnectLazily, opts);
+    return () => {
+      // The ROUTE is compared, never used to pick one. Reviewed local and
+      // executed remote is a change of machine, not just of surface: the card
+      // named element [5] from the local snapshot, and id 5 on the sidecar is
+      // a different element. Re-resolving here is safe precisely because the
+      // answer is only ever tested for equality -- an absent machine scope or
+      // a sidecar that connected in between fails the approval closed instead
+      // of silently retargeting it.
+      let nowRoute: string | null;
+      try {
+        nowRoute = resolveBrowserTarget(params, tool);
+      } catch {
+        return false;
+      }
+      if (nowRoute !== reviewedRoute) return false;
+      // Remote: nothing in this process holds the reviewed surface. The
+      // sidecar runs its own document and generation checks at use time, and
+      // the arguments (including `target`) are already compared byte for byte
+      // by `getUiExecutionRegistry`.
+      return local ? local() : true;
+    };
+  };
 }
 
 /**
@@ -939,6 +1169,7 @@ function reportSkippedPlaybook(tool: string, target: string, read: SidecarPageRe
 
 export const browserNavigateTool: ToolDefinition = {
   name: 'browser_navigate',
+  captureApprovalGuard: browserCallGuard('browser_navigate'),
   description: 'Navigate the browser to a URL. Returns page text content and a list of interactive elements with [id] numbers you can reference in browser_click and browser_type. Optionally specify a "target" sidecar to use a remote browser. By default the browser opens visibly so the user can watch and interact; set "headless" to true to run it hidden in the background (useful for research, or when the user is focused on something else and a popping browser window would be intrusive).',
   category: 'browser',
   parameters: {
@@ -1017,7 +1248,8 @@ export const browserSnapshotTool: ToolDefinition = {
 
 export const browserClickTool: ToolDefinition = {
   name: 'browser_click',
-  description: 'Click an interactive element on the page by its [id] from the last browser_navigate or browser_snapshot. Supports right-click (button: "right", opens context menus) and double-click (double: true).',
+  captureApprovalGuard: browserCallGuard('browser_click', { bindDocument: true }),
+  description: 'Click an interactive element on the page by its [id] from the last browser_navigate or browser_snapshot. The [id]s expire: scrolling, a paging key, or the page replacing or moving the element retires them, and this refuses rather than clicking the wrong place - take a fresh browser_snapshot when it says so. Supports right-click (button: "right", opens context menus) and double-click (double: true).',
   category: 'browser',
   parameters: {
     element_id: {
@@ -1065,6 +1297,7 @@ export const browserClickTool: ToolDefinition = {
 
 export const browserHoverTool: ToolDefinition = {
   name: 'browser_hover',
+  captureApprovalGuard: browserCallGuard('browser_hover', { bindDocument: true }),
   description: 'Hover the mouse over an element by its [id]. Use this to reveal hover-only UI (message action toolbars, dropdown triggers, tooltips). After hovering, take a browser_snapshot to see the revealed elements, then click them without moving the mouse elsewhere first.',
   category: 'browser',
   parameters: {
@@ -1096,7 +1329,8 @@ export const browserHoverTool: ToolDefinition = {
 
 export const browserPressKeyTool: ToolDefinition = {
   name: 'browser_press_key',
-  description: 'Press a key or key combination in the browser page (sent to the focused element). Examples: "Enter", "Escape", "Tab", "ArrowDown", "Ctrl+K", "Shift+Enter", "Ctrl+Shift+M". Use for in-app keyboard shortcuts, menu navigation, and committing edits. Note: browser-reserved shortcuts (Ctrl+N, Ctrl+T, Ctrl+1-9) are intercepted by Chrome and never reach the page — use in-page UI for those actions instead.',
+  captureApprovalGuard: browserCallGuard('browser_press_key'),
+  description: 'Press a key or key combination in the browser page (sent to the focused element). Examples: "Enter", "Escape", "Tab", "ArrowDown", "Ctrl+K", "Shift+Enter", "Ctrl+Shift+M". Use for in-app keyboard shortcuts, menu navigation, and committing edits. Note: browser-reserved shortcuts (Ctrl+N, Ctrl+T, Ctrl+1-9) are intercepted by Chrome and never reach the page — use in-page UI for those actions instead. PageUp, PageDown, Home and End scroll the page, which retires every element [id]: snapshot again before using one.',
   category: 'browser',
   parameters: {
     key: {
@@ -1127,6 +1361,7 @@ export const browserPressKeyTool: ToolDefinition = {
 
 export const browserTypeTool: ToolDefinition = {
   name: 'browser_type',
+  captureApprovalGuard: browserCallGuard('browser_type', { bindDocument: true }),
   description: 'Type text into an input element by its [id]. IMPORTANT: by default this REPLACES the element\'s existing content (it is cleared first). Set append to true to keep existing content and add at the end. Set submit to true to press Enter after typing (useful for search forms).',
   category: 'browser',
   parameters: {
@@ -1330,7 +1565,8 @@ export const browserUploadFileTool: ToolDefinition = {
 
 export const browserScrollTool: ToolDefinition = {
   name: 'browser_scroll',
-  description: 'Scroll the page up or down. Use this when you need to see content below the fold. After scrolling, use browser_snapshot to see the new content.',
+  captureApprovalGuard: browserCallGuard('browser_scroll'),
+  description: 'Scroll the page up or down. Use this when you need to see content below the fold. Scrolling RETIRES every element [id] from the last snapshot, because their positions have moved: take a browser_snapshot afterwards and use the fresh [id]s.',
   category: 'browser',
   parameters: {
     direction: {
@@ -1371,7 +1607,8 @@ export const browserScrollTool: ToolDefinition = {
 
 export const browserEvaluateTool: ToolDefinition = {
   name: 'browser_evaluate',
-  description: 'Execute JavaScript in the browser page context. Use this for advanced interactions when the standard tools are not enough.',
+  captureApprovalGuard: browserCallGuard('browser_evaluate'),
+  description: 'Execute JavaScript in the browser page context. Use this for advanced interactions when the standard tools are not enough. Long results are truncated, so return the value you need rather than a whole document.',
   category: 'browser',
   parameters: {
     expression: {
@@ -1395,9 +1632,17 @@ export const browserEvaluateTool: ToolDefinition = {
     try {
       const result = await browser.evaluate(params.expression as string);
       if (result === undefined || result === null) return '(no return value)';
-      return typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+      // Capped for the reason the snapshot's title line is (#597): the VALUE is
+      // the page's and was unbounded, so a megabyte return filled the model's
+      // context here and, on the sidecar's identical path, got the whole reply
+      // dropped at the 2 MB cap with no error. Marked but NOT stripped: an
+      // evaluate result is routinely `innerText` or pretty-printed JSON, and
+      // flattening those would mangle every ordinary answer.
+      const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+      return truncateMarked(text, MAX_PAGE_CONTROLLED_REPLY);
     } catch (err) {
-      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+      const message = err instanceof Error ? err.message : String(err);
+      return `Error: ${truncateMarked(message, MAX_PAGE_CONTROLLED_REPLY)}`;
     }
   },
 };
@@ -1588,8 +1833,20 @@ export function createBrowserTools(ctrl: BrowserController): ToolDefinition[] {
       },
     },
   ];
+  // Every tool here is bound to THIS controller and can only run locally, so
+  // the guard is the controller's own -- no routing term, unlike the main
+  // registry's `browserCallGuard`.
+  //
+  // The element-addressed three bind the SURFACE as well (#602): an approval
+  // reviewed against one snapshot must not execute against another, and a
+  // snapshot of the same document re-numbers every id while the loaderId holds.
+  const elementAddressed = new Set(['browser_click', 'browser_type', 'browser_hover']);
   for (const tool of tools) {
-    tool.captureApprovalGuard = () => ctrl.captureApprovalGuard(tool.name === 'browser_navigate');
+    const bindDocument = elementAddressed.has(tool.name);
+    // Same rule as the main registry: everything that connects lazily may be
+    // reviewed against a cold browser, and only the element-addressed tools
+    // genuinely require the snapshot that minted their ids.
+    tool.captureApprovalGuard = () => ctrl.captureApprovalGuard(!bindDocument, { bindDocument });
   }
   return tools;
 }

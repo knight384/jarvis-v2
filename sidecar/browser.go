@@ -77,7 +77,9 @@ type cdpClient struct {
 	//                 and fully self-consistent. Before #592 that left live,
 	//                 clickable, stale coordinates; now the identity no longer
 	//                 matches the page, so every reader refuses.
-	//   elemGen       bumped on every fill. It closes a window an identity
+	//   elemGen       bumped on every fill, and on every DROP (#603 added three
+	//                 geometry-moving tools to the one snapshot-failure path).
+	//                 It closes a window an identity
 	//                 check cannot see: a snapshot of the SAME document
 	//                 refilling the map while a reader is mid-answer leaves the
 	//                 loaderId unchanged, so a reader that copied a coordinate
@@ -121,6 +123,56 @@ type cdpClient struct {
 	worldMu       sync.Mutex
 	worldLoaderID string
 	worldContext  float64
+
+	// The same two things for the ACCESSIBILITY surface (#602).
+	//
+	// Separate from the fields above, not shared with them, for a reason that
+	// bites immediately if they are merged: `elementWorldFor` hands the DOM
+	// action paths a world they expect to hold `__jarvis_elements`. A world
+	// minted for an AX call holds no refs, and overwriting `worldContext` with
+	// it would make every `browser_type` refuse with "cannot be addressed any
+	// more" until the next DOM snapshot.
+	//
+	// Note that browser_ax_click DOES retire the DOM snapshot's ids, since
+	// #603 -- it scrolls, so their coordinates have moved -- but it says so
+	// through the ordinary "run browser_snapshot first" path rather than by
+	// breaking the world out from under a ref.
+	//
+	// axIdentity is the document `browser_ax_snapshot` last read, axIDs are the
+	// ids it actually emitted, and axGen counts the fills. Before this,
+	// browser_ax_click and browser_ax_set_value were the only action paths in
+	// the sidecar with no document binding at all -- and with no local-content
+	// refusal either, which made a `file:` or `chrome://settings` page
+	// clickable through them.
+	//
+	// THE ID SET IS NOT OPTIONAL, which is what measuring corrected: a
+	// backendNodeId is RENDERER-PROCESS-LOCAL and restarts at 1 on every
+	// cross-site navigation, so ids minted in different documents collide --
+	// measured, two fresh renderers both numbered their inputs 1, 2, 3, and
+	// `DOM.resolveNode` of a previous site's id resolved cleanly to a
+	// DIFFERENT element on the new page. A document comparison alone therefore
+	// does not make an id mean what it meant: snapshot A, navigate, snapshot B,
+	// act on A's id, and every identity term agrees while the id resolves
+	// against B. The DOM path has this right already -- there each id carries
+	// its own document, because it comes out of the per-element map.
+	//
+	// Membership also closes a widening nothing else bounds: without it, any
+	// backendNodeId in the document was actionable after any AX snapshot,
+	// including the nodes `buildAXElements` filtered out (ignored, unnamed and
+	// not interactive, no backing DOM node) and the tail it dropped at the
+	// reply budget -- elements the model was never shown and the card never
+	// named.
+	axMu       sync.Mutex
+	axIdentity pageIdentity
+	axIDs      map[int64]bool
+	axGen      uint64
+
+	// The AX path's own isolated world, under its own mutex so a mint cannot
+	// park a concurrent snapshot's bookkeeping behind a browser round trip --
+	// the reason the DOM path keeps `elemMu` and `worldMu` apart.
+	axWorldMu     sync.Mutex
+	axWorldLoader string
+	axWorldCtx    float64
 
 	// One-shot waiters for CDP events (e.g. Page.loadEventFired).
 	eventMu      sync.Mutex
@@ -904,8 +956,9 @@ func makeBrowserClickHandler(cfg *SidecarConfig) RPCHandler {
 
 		id := int(elemID)
 		// The coordinates are only this click's honest input while the document
-		// they were measured in is still the one on screen (#592).
-		el, _, refusal, err := refuseStaleElement(cdp, id)
+		// they were measured in is still the one on screen (#592) and the page
+		// has not scrolled under them (#603) -- hence `usesCoordinates`.
+		el, _, refusal, err := refuseStaleElement(cdp, id, true)
 		if err != nil {
 			return nil, err
 		}
@@ -949,7 +1002,10 @@ func makeBrowserTypeHandler(cfg *SidecarConfig) RPCHandler {
 		}
 
 		id := int(elemID)
-		el, contextID, refusal, err := refuseStaleElement(cdp, id)
+		// NOT a coordinate user: the typing reaches the element through the ref
+		// the snapshot stashed, so a scroll since then does not make this call
+		// wrong -- and typing itself scrolls the caret into view (#603).
+		el, contextID, refusal, err := refuseStaleElement(cdp, id, false)
 		if err != nil {
 			return nil, err
 		}
@@ -1232,10 +1288,35 @@ func makeBrowserScrollHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, fmt.Errorf("scroll failed: %w", err)
 		}
 
+		// EVERY COORDINATE THE SNAPSHOT HANDED OUT NOW DESCRIBES WHERE AN
+		// ELEMENT USED TO BE (#603).
+		//
+		// Scrolling moves every element and changes nothing the frame tree
+		// reports, so no document check could see it: the map stayed live and
+		// clickable, and a click after a scroll dispatched a trusted mouse
+		// event at the previous viewport's geometry -- reachable with no page
+		// involvement at all, just two tool calls.
+		//
+		// Dropped here as well as covered by the use-time sentinel, because the
+		// two reach different readers. The sentinel compares each element's
+		// LIVE position and so covers every geometry change for the paths that
+		// ask it (click, hover), including the ones no tool announces. This
+		// drop reaches the readers that deliberately do NOT run it:
+		// browser_element_point, which answers a pebble coordinate under a
+		// 700 ms budget. It covers THIS scroll only -- a paging key and
+		// browser_ax_click's scrollIntoViewIfNeeded drop the map themselves for
+		// the same reason, and a page scrolling itself reaches neither, so the
+		// pebble can still be a scroll behind on a page that moves on a timer.
+		//
+		// The model is already told to re-snapshot after scrolling, by this
+		// tool's own description and by all 100 webapp templates.
+		cdp.forgetSnapshotElements()
+
 		// Wait for lazy-loaded content (matches the daemon)
 		time.Sleep(500 * time.Millisecond)
 
-		return &RPCResult{Result: fmt.Sprintf("Scrolled %s by %dpx", direction, int(scrollAmount))}, nil
+		return &RPCResult{Result: fmt.Sprintf("Scrolled %s by %dpx. %s",
+			direction, int(scrollAmount), retiredIDsNotice)}, nil
 	}
 }
 
@@ -1284,22 +1365,36 @@ func makeBrowserEvaluateHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, fmt.Errorf("evaluate: parse reply: %w", err)
 		}
 		if parsed.ExceptionDetails != nil {
-			return nil, fmt.Errorf("JS error: %s", string(parsed.ExceptionDetails))
+			// Capped like every other page-controlled reply (#597): the page
+			// writes this message, and an uncapped one gets the whole reply
+			// dropped at the brain's 2 MB cap instead of reaching the model.
+			return nil, fmt.Errorf("JS error: %s",
+				truncateMarked(string(parsed.ExceptionDetails), maxPageControlledReply))
 		}
 		if parsed.Result.Value == nil || string(parsed.Result.Value) == "null" {
 			return &RPCResult{Result: "(no return value)"}, nil
 		}
+		// The VALUE is the page's too, and was just as unbounded as its title
+		// (#597): one `document.body.innerHTML` gets this reply dropped whole at
+		// the brain's 2 MB cap, so the model sees neither the value nor a
+		// reason. EVERY branch is capped, starting with the string one -- it is
+		// the overwhelmingly common return (`innerText`, `innerHTML`, a
+		// `JSON.stringify` inside the expression), so capping only the other two
+		// would have left the issue open on the path that is actually used.
+		//
+		// truncateMarked, not truncateRendered: an evaluate result is
+		// legitimately multi-line and must not be flattened.
 		var asString string
 		if json.Unmarshal(parsed.Result.Value, &asString) == nil {
-			return &RPCResult{Result: asString}, nil
+			return &RPCResult{Result: truncateMarked(asString, maxPageControlledReply)}, nil
 		}
 		var pretty any
 		if json.Unmarshal(parsed.Result.Value, &pretty) == nil {
 			if out, err := json.MarshalIndent(pretty, "", "  "); err == nil {
-				return &RPCResult{Result: string(out)}, nil
+				return &RPCResult{Result: truncateMarked(string(out), maxPageControlledReply)}, nil
 			}
 		}
-		return &RPCResult{Result: string(parsed.Result.Value)}, nil
+		return &RPCResult{Result: truncateMarked(string(parsed.Result.Value), maxPageControlledReply)}, nil
 	}
 }
 

@@ -30,40 +30,40 @@ type keyDef struct {
 }
 
 var namedKeys = map[string]keyDef{
-	"enter":     {"Enter", "Enter", 13, "\r"},
-	"tab":       {"Tab", "Tab", 9, ""},
-	"escape":    {"Escape", "Escape", 27, ""},
-	"esc":       {"Escape", "Escape", 27, ""},
-	"backspace": {"Backspace", "Backspace", 8, ""},
-	"delete":    {"Delete", "Delete", 46, ""},
-	"del":       {"Delete", "Delete", 46, ""},
-	"space":     {" ", "Space", 32, " "},
-	"arrowup":   {"ArrowUp", "ArrowUp", 38, ""},
-	"up":        {"ArrowUp", "ArrowUp", 38, ""},
-	"arrowdown": {"ArrowDown", "ArrowDown", 40, ""},
-	"down":      {"ArrowDown", "ArrowDown", 40, ""},
-	"arrowleft": {"ArrowLeft", "ArrowLeft", 37, ""},
-	"left":      {"ArrowLeft", "ArrowLeft", 37, ""},
+	"enter":      {"Enter", "Enter", 13, "\r"},
+	"tab":        {"Tab", "Tab", 9, ""},
+	"escape":     {"Escape", "Escape", 27, ""},
+	"esc":        {"Escape", "Escape", 27, ""},
+	"backspace":  {"Backspace", "Backspace", 8, ""},
+	"delete":     {"Delete", "Delete", 46, ""},
+	"del":        {"Delete", "Delete", 46, ""},
+	"space":      {" ", "Space", 32, " "},
+	"arrowup":    {"ArrowUp", "ArrowUp", 38, ""},
+	"up":         {"ArrowUp", "ArrowUp", 38, ""},
+	"arrowdown":  {"ArrowDown", "ArrowDown", 40, ""},
+	"down":       {"ArrowDown", "ArrowDown", 40, ""},
+	"arrowleft":  {"ArrowLeft", "ArrowLeft", 37, ""},
+	"left":       {"ArrowLeft", "ArrowLeft", 37, ""},
 	"arrowright": {"ArrowRight", "ArrowRight", 39, ""},
 	"right":      {"ArrowRight", "ArrowRight", 39, ""},
-	"home":     {"Home", "Home", 36, ""},
-	"end":      {"End", "End", 35, ""},
-	"pageup":   {"PageUp", "PageUp", 33, ""},
-	"pagedown": {"PageDown", "PageDown", 34, ""},
-	"/":        {"/", "Slash", 191, "/"},
-	".":        {".", "Period", 190, "."},
-	",":        {",", "Comma", 188, ","},
-	";":        {";", "Semicolon", 186, ";"},
-	"'":        {"'", "Quote", 222, "'"},
-	"[":        {"[", "BracketLeft", 219, "["},
-	"]":        {"]", "BracketRight", 221, "]"},
-	"\\":       {"\\", "Backslash", 220, "\\"},
-	"`":        {"`", "Backquote", 192, "`"},
-	"-":        {"-", "Minus", 189, "-"},
-	"=":        {"=", "Equal", 187, "="},
-	"?":        {"?", "Slash", 191, "?"},
-	"@":        {"@", "Digit2", 50, "@"},
-	"#":        {"#", "Digit3", 51, "#"},
+	"home":       {"Home", "Home", 36, ""},
+	"end":        {"End", "End", 35, ""},
+	"pageup":     {"PageUp", "PageUp", 33, ""},
+	"pagedown":   {"PageDown", "PageDown", 34, ""},
+	"/":          {"/", "Slash", 191, "/"},
+	".":          {".", "Period", 190, "."},
+	",":          {",", "Comma", 188, ","},
+	";":          {";", "Semicolon", 186, ";"},
+	"'":          {"'", "Quote", 222, "'"},
+	"[":          {"[", "BracketLeft", 219, "["},
+	"]":          {"]", "BracketRight", 221, "]"},
+	"\\":         {"\\", "Backslash", 220, "\\"},
+	"`":          {"`", "Backquote", 192, "`"},
+	"-":          {"-", "Minus", 189, "-"},
+	"=":          {"=", "Equal", 187, "="},
+	"?":          {"?", "Slash", 191, "?"},
+	"@":          {"@", "Digit2", 50, "@"},
+	"#":          {"#", "Digit3", 51, "#"},
 }
 
 func init() {
@@ -217,11 +217,58 @@ func makeBrowserPressKeyHandler(cfg *SidecarConfig) RPCHandler {
 			return nil, fmt.Errorf("key up failed: %w", err)
 		}
 
+		// A PAGING KEY SCROLLS when nothing has swallowed it, which moves every
+		// coordinate the snapshot handed out with nothing any document check
+		// can see (#603). The action paths notice at use time; the pebble's
+		// coordinate readers deliberately do not run that sentinel, so the map
+		// is dropped here rather than leaving them pointing at a pre-scroll
+		// position.
+		//
+		// Only the paging keys. Enter, Tab and the arrows are the keys a model
+		// presses while working through a list it has already snapshotted, and
+		// clearing on those would break "press Enter, then click [5]" for the
+		// sake of a cosmetic pointer.
+		retiredIDs := scrollsThePage(pk.Key)
+		if retiredIDs {
+			cdp.forgetSnapshotElements()
+		}
+
 		// Let the app react (menu open, mode switch, etc.)
 		time.Sleep(300 * time.Millisecond)
 
+		// SAID, not just done, exactly as browser_scroll says it: the model is
+		// the one that has to take a fresh snapshot, and "Element [5] not
+		// found" on the next call reads as "that id was never valid".
+		if retiredIDs {
+			return &RPCResult{Result: fmt.Sprintf("Pressed %s. %s", pk.Display, retiredIDsNotice)}, nil
+		}
 		return &RPCResult{Result: fmt.Sprintf("Pressed %s", pk.Display)}, nil
 	}
+}
+
+// retiredIDsNotice is what every tool that drops the coordinate map tells the
+// model (#603). One string, so browser_scroll and browser_press_key cannot
+// word it differently; `RETIRED_IDS_NOTICE` in src/actions/browser/session.ts
+// is the same sentence, and browser_parity_test.go compares it exactly.
+const retiredIDsNotice = "Element ids from the previous snapshot no longer apply " +
+	"-- take a browser_snapshot before acting on one."
+
+// scrollsThePage reports whether a key moves the viewport when the page has not
+// taken it for something else (#603). Keep in step with `scrollsThePage` in
+// src/actions/browser/session.ts.
+//
+// The key NAME alone, which over-refuses: `End` and `Home` move the caret
+// rather than the viewport when a text field has focus, and then the ids were
+// retired for nothing. Accepted, in that direction only -- it costs a snapshot
+// the templates already take (every editor recipe that presses End
+// re-snapshots before reusing an id), where the other direction costs a click
+// at a coordinate that has moved.
+func scrollsThePage(key string) bool {
+	switch key {
+	case "PageDown", "PageUp", "Home", "End":
+		return true
+	}
+	return false
 }
 
 func makeBrowserHoverHandler(cfg *SidecarConfig) RPCHandler {
@@ -240,7 +287,9 @@ func makeBrowserHoverHandler(cfg *SidecarConfig) RPCHandler {
 		// Same document guard as click and type: a hover moves a trusted
 		// pointer, and doing it at the previous document's geometry can reveal
 		// or trigger UI nobody reviewed (#592).
-		el, _, refusal, err := refuseStaleElement(cdp, id)
+		// Hover dispatches at the stored coordinate, so a scroll since the
+		// snapshot disqualifies it (#603).
+		el, _, refusal, err := refuseStaleElement(cdp, id, true)
 		if err != nil {
 			return nil, err
 		}

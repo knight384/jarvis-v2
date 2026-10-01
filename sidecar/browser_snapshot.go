@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -49,7 +50,8 @@ const browserSnapshotScript = `(() => {
   };
   collectFrames(document, 0, 0, 0);
 
-  for (const frame of frames) {
+  for (let fi = 0; fi < frames.length; fi++) {
+    const frame = frames[fi];
     const doc = frame.doc;
     const win = doc.defaultView || window;
     const inFrame = doc !== document;
@@ -81,6 +83,7 @@ const browserSnapshotScript = `(() => {
       if (inFrame) attrs.iframe = 'true';
       els.push({
         _el: el,
+        _fi: fi,
         tag,
         text,
         attrs,
@@ -103,7 +106,62 @@ const browserSnapshotScript = `(() => {
   // per-context. globalThis is here to tell a reader the script is not meant
   // for the page's world.
   globalThis.__jarvis_elements = els.map(e => e._el);
-  els.forEach((el, i) => { el.id = i + 1; delete el._el; });
+
+  // WHAT WAS TRUE WHEN THESE IDS WERE HANDED OUT, so a use-time guard can tell
+  // that the thing an id names has changed while every field the frame tree
+  // reports stayed put (#603).
+  //
+  // Three parts, each answering something no other check can see:
+  //
+  //   __jarvis_points   where each element WAS, in the same top-page viewport
+  //                     space and the same rounding the click dispatches at.
+  //                     Comparing the element's live centre to this is the
+  //                     exact question -- "is the coordinate still where the
+  //                     element is" -- where comparing the window's scroll
+  //                     offset is only a proxy for it, and a bad one in both
+  //                     directions: a position: fixed consent banner or a
+  //                     sticky header does not move when the window scrolls
+  //                     (so the proxy refuses a click that would have been
+  //                     perfectly good), while an overflow: auto list
+  //                     scrolling its own contents -- Gmail's message list,
+  //                     Linear's issue list, a virtualised table, a chat log
+  //                     -- moves every element inside it without touching
+  //                     window.scrollY at all (so the proxy misses the
+  //                     commonest staleness there is). Reflow from a
+  //                     late-loading banner, a settling lazy image, a window
+  //                     resize and a zoom change are all missed by the proxy
+  //                     and caught by this.
+  //   __jarvis_frames   which frame each element came from, so a frame that
+  //                     rewrites itself invalidates only ITS OWN elements. The
+  //                     app's own same-origin iframes churn constantly (a
+  //                     Google Docs or Gmail compose editor lives in one), and
+  //                     a cross-origin ad frame is never collected here at all,
+  //                     so "some frame changed" would refuse typing into the
+  //                     editor because a sibling frame reloaded.
+  //   __jarvis_dom      each frame's documentElement, body and scroll offset.
+  //                     The first two are how a REPLACED document is detected:
+  //                     document.open()/write() replaces both while the
+  //                     loaderId and the URL both hold (measured), and a
+  //                     Turbo-style whole-body swap replaces the body alone
+  //                     (measured), while pushState and an innerHTML re-render
+  //                     anywhere in the tree touch neither (measured) -- which
+  //                     is what makes this safe on every ordinary SPA click.
+  //                     The scroll offset stays as the FALLBACK for an element
+  //                     whose own node the page has since replaced, where
+  //                     there is no live rect to compare.
+  globalThis.__jarvis_points = els.map(e => [e.x, e.y]);
+  globalThis.__jarvis_frames = els.map(e => e._fi);
+  els.forEach((el, i) => { el.id = i + 1; delete el._el; delete el._fi; });
+
+  globalThis.__jarvis_dom = frames.map(f => {
+    const w = f.doc.defaultView;
+    return [
+      f.doc.documentElement,
+      f.doc.body,
+      w ? Math.round(w.scrollX || 0) : 0,
+      w ? Math.round(w.scrollY || 0) : 0
+    ];
+  });
 
   let bodyText = (document.body && document.body.innerText) || '';
   for (const frame of frames) {
@@ -234,7 +292,12 @@ func takePageSnapshot(cdp *cdpClient) (*pageSnapshot, pageIdentity, error) {
 		return nil, checked, fmt.Errorf("parse snapshot reply: %w", err)
 	}
 	if wrapper.ExceptionDetails != nil {
-		return nil, checked, fmt.Errorf("snapshot failed: %s", string(wrapper.ExceptionDetails))
+		// Capped: `exceptionDetails` carries the page's own message and stack,
+		// so an uncapped interpolation here is the same dropped-reply bug as the
+		// title line was (#597) -- a page that throws a multi-megabyte Error
+		// would lose its own snapshot's error to the 2 MB event cap.
+		return nil, checked, fmt.Errorf("snapshot failed: %s",
+			truncateMarked(string(wrapper.ExceptionDetails), maxPageControlledReply))
 	}
 
 	var snap pageSnapshot
@@ -360,6 +423,14 @@ func (c *cdpClient) elementWorldFor(loaderID string) (float64, bool) {
 // Called from a deferred cleanup in takePageSnapshot so that EVERY failure path
 // clears, including ones added later -- the alternative, clearing at each
 // `return`, is one new return away from regressing.
+//
+// AND, since #603, from the three tools that move the page's geometry without
+// navigating: browser_scroll, a paging key through browser_press_key, and
+// browser_ax_click's scrollIntoViewIfNeeded. Their reason is different -- the
+// coordinates describe where an element used to be -- and the action paths
+// would refuse at use time anyway; what the drop buys is the readers that
+// deliberately do not run that check, the pebble's coordinate and screen
+// origin, which would otherwise keep pointing at a pre-scroll position.
 func (c *cdpClient) forgetSnapshotElements() {
 	c.elemMu.Lock()
 	c.elemCoords = nil
@@ -426,7 +497,12 @@ func (c *cdpClient) snapshotElementFor(id int) (snapshotElement, bool) {
 //
 // The document comparison is the loaderId ALONE -- see confirmSameDocument for
 // why the URL term would refuse an ordinary click on every SPA.
-func refuseStaleElement(cdp *cdpClient, id int) (snapshotElement, float64, string, error) {
+//
+// `usesCoordinates` says whether this caller will DISPATCH AT the stored
+// coordinate (click, hover) or only use the id to find its element ref
+// (type). It decides whether a scroll since the snapshot is disqualifying:
+// a scroll moves every coordinate and invalidates no ref (#603).
+func refuseStaleElement(cdp *cdpClient, id int, usesCoordinates bool) (snapshotElement, float64, string, error) {
 	el, found := cdp.snapshotElementFor(id)
 	if !found {
 		return snapshotElement{}, 0, fmt.Sprintf("Error: Element [%d] not found. Run browser_snapshot first.", id), nil
@@ -465,6 +541,38 @@ func refuseStaleElement(cdp *cdpClient, id int) (snapshotElement, float64, strin
 		return snapshotElement{}, 0, fmt.Sprintf(
 			"Error: Element [%d] cannot be addressed any more. Run browser_snapshot first.", id), nil
 	}
+	// The DOCUMENT may also have been replaced WITHOUT a new loaderId, and the
+	// page may have scrolled (#603). Neither moves anything the frame tree
+	// reports, so the terms above cannot see either one; both leave every
+	// coordinate describing where an element used to be.
+	//
+	// Scoped exactly like the frame digest: a top-document change refuses every
+	// id, a subframe change refuses only ids taken from a subframe. Without
+	// that scoping a same-origin ad iframe rewriting itself on a timer would
+	// refuse clicks on the main document -- page-triggerable denial of the
+	// whole action path.
+	switch cdp.domGeneration(ctx, id-1) {
+	case "gone":
+		return snapshotElement{}, 0, fmt.Sprintf(
+			"Error: Element [%d] cannot be addressed any more. Run browser_snapshot first.", id), nil
+	case "busy":
+		return snapshotElement{}, 0, fmt.Sprintf(
+			"Error: The page was too busy to confirm where element [%d] is, so nothing was done. Try again.",
+			id), nil
+	case "dom":
+		return snapshotElement{}, 0, fmt.Sprintf(
+			"Error: The page replaced the document element [%d] came from, so it no longer exists. "+
+				"Run browser_snapshot first.", id), nil
+	case "moved":
+		// Only a caller that DISPATCHES AT the coordinate cares: see
+		// `usesCoordinates` on this function and the sentinel's own docblock.
+		if usesCoordinates {
+			return snapshotElement{}, 0, fmt.Sprintf(
+				"Error: Element [%d] has moved since the snapshot, so its position can no longer be trusted. "+
+					"Run browser_snapshot first.", id), nil
+		}
+	}
+
 	// LAST, so nothing can land after it: a concurrent snapshot of the SAME
 	// document re-mints every coordinate AND re-arms the world, leaving the
 	// loaderId untouched -- so the identity check above cannot see it, and
@@ -478,6 +586,148 @@ func refuseStaleElement(cdp *cdpClient, id int) (snapshotElement, float64, strin
 				"Run browser_snapshot first.", id), nil
 	}
 	return el, ctx, "", nil
+}
+
+// domGenerationScriptFor asks the isolated world what has changed for ONE
+// element since the snapshot handed out its id (#603).
+//
+// PER ELEMENT, not per page, because the answer differs per element and the
+// coarse version was wrong in both directions: a page-wide scroll comparison
+// refuses a click on a `position: fixed` consent banner that has not moved,
+// and misses an `overflow: auto` list that has scrolled every element inside
+// it without touching `window.scrollY`. See the arming block above.
+//
+// TWO VERDICTS, because they invalidate different things and the callers use
+// different things:
+//
+//	'dom'    this element's own document, or the top document, was REPLACED.
+//	         Every ref and every coordinate in it is stale, so every caller
+//	         refuses -- including `browser_type`, which holds a ref.
+//	'moved'  the element is still there and is no longer where the id says.
+//	         Only a caller that DISPATCHES AT the coordinate cares:
+//	         `browser_type` reaches its element through the ref and never
+//	         reads the coordinate, and typing scrolls the caret into view, so
+//	         refusing it here would make the second type into one
+//	         contenteditable refuse itself.
+//
+// 'ok' is "nothing that matters to this id has changed"; 'gone' is "the world
+// holds no reading for this id", which every caller refuses.
+//
+// The index is interpolated the way the focus script interpolates it. Keep in
+// step with `domGenerationScript` in src/actions/browser/session.ts.
+func domGenerationScriptFor(index int) string {
+	return fmt.Sprintf(`(() => {
+  const dom = globalThis.__jarvis_dom;
+  const pts = globalThis.__jarvis_points;
+  const fis = globalThis.__jarvis_frames;
+  const i = %d;
+  if (!dom || !dom.length || !pts || !fis) return 'gone';
+  const frameIntact = (k) => {
+    const entry = dom[k];
+    if (!entry) return false;
+    const root = entry[0];
+    // A frame with no documentElement was never bindable: it contributed no
+    // element and no coordinate, so it cannot invalidate one.
+    if (!root) return true;
+    const doc = root.ownerDocument;
+    const win = doc && doc.defaultView;
+    if (!doc || !win) return false;
+    if (doc.documentElement !== root) return false;
+    if (doc.body !== entry[1]) return false;
+    return true;
+  };
+  // The top document always matters: an element in a frame is positioned by it.
+  if (!frameIntact(0)) return 'dom';
+  const fi = fis[i];
+  if (typeof fi !== 'number' || !dom[fi] || !pts[i]) return 'gone';
+  if (fi !== 0 && !frameIntact(fi)) return 'dom';
+  const el = globalThis.__jarvis_elements && globalThis.__jarvis_elements[i];
+  if (el && el.isConnected) {
+    // The element's centre in TOP-PAGE viewport space: the same quantity the
+    // snapshot stored, walked back up through the same frame offsets.
+    let w = el.ownerDocument.defaultView, ox = 0, oy = 0, hops = 0;
+    while (w && w.frameElement && hops++ < 10) {
+      const fr = w.frameElement.getBoundingClientRect();
+      ox += fr.x; oy += fr.y;
+      w = w.frameElement.ownerDocument.defaultView;
+    }
+    if (w && !w.frameElement) {
+      const r = el.getBoundingClientRect();
+      const x = Math.round(ox + r.x + r.width / 2);
+      const y = Math.round(oy + r.y + r.height / 2);
+      // One pixel of tolerance for sub-pixel layout, which is also the most a
+      // click can be off by and still land on the same place.
+      return (Math.abs(x - pts[i][0]) <= 1 && Math.abs(y - pts[i][1]) <= 1) ? 'ok' : 'moved';
+    }
+  }
+  // The node the snapshot held is gone or cannot be placed. That does NOT by
+  // itself make the coordinate wrong -- an ordinary SPA re-render replaces
+  // nodes constantly while the thing on screen stays put -- so fall back to
+  // the frame's scroll offset, which is what the coarse check used to be.
+  const entry = dom[fi];
+  const root = entry[0];
+  const win = root && root.ownerDocument && root.ownerDocument.defaultView;
+  if (!win) return 'gone';
+  return (Math.round(win.scrollX || 0) === entry[2] && Math.round(win.scrollY || 0) === entry[3]) ? 'ok' : 'moved';
+})()`, index)
+}
+
+// domSentinelTimeout bounds the sentinel's own read.
+//
+// It is RENDERER-SERVED, which is new for the click and hover paths: before
+// #603 those touched only the browser process and could not be held up by the
+// page's main thread at all. Inheriting cdpDefaultTimeout's 30 seconds would
+// mean a janked page -- or a modal `alert()`, which nothing here dismisses --
+// parked a click for half a minute before refusing it. Long enough that a
+// merely slow page still answers, short enough that a blocked one is reported
+// as blocked.
+const domSentinelTimeout = 4 * time.Second
+
+// domGeneration runs the sentinel in the world the element refs live in, for
+// one element index.
+//
+// Fails CLOSED in two distinguishable ways: "gone" (the world holds no reading
+// for this id, or the read failed in a way a retry will not mend) and "busy"
+// (the renderer did not answer in time, which is RETRYABLE and must not tell
+// the model to take a snapshot the same renderer will not serve either).
+//
+// DELIBERATELY NOT inside `confirmSameDocument`. That function is
+// browser-process-only (`Page.getFrameTree`), which is what makes it safe under
+// `browser_element_point`'s 700 ms budget; this is renderer-served and an
+// `alert()` can block it, so it belongs to the ACTION paths, which have no such
+// budget, and not to the coordinate reply that a narration races.
+func (c *cdpClient) domGeneration(contextID float64, index int) string {
+	raw, err := c.sendOnTimeout(c.sessionID, "Runtime.evaluate", map[string]any{
+		"contextId":     contextID,
+		"returnByValue": true,
+		"expression":    domGenerationScriptFor(index),
+	}, domSentinelTimeout)
+	if err != nil {
+		// ONLY a timeout is retryable. `sendOnTimeout` also errors for a closed
+		// pipe and for a CDP error reply -- and "Cannot find context with
+		// specified id", which is what a destroyed world answers, is the
+		// commonest one here. Calling that "busy" would tell the model to try
+		// again forever instead of to take a fresh snapshot, and would disagree
+		// with the daemon's half, which answers 'gone' for the same condition.
+		if errors.Is(err, errCDPTimeout) {
+			return "busy"
+		}
+		return "gone"
+	}
+	var parsed struct {
+		Result struct {
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "gone"
+	}
+	switch parsed.Result.Value {
+	case "ok", "dom", "moved":
+		return parsed.Result.Value
+	default:
+		return "gone"
+	}
 }
 
 // focusStillOnElement reports whether the element the snapshot called `id`
@@ -584,22 +834,204 @@ func collectFrameStamp(node *frameTreeNode, out *[]string) {
 }
 
 // Formatter limits — keep in sync with src/actions/tools/builtin.ts.
+//
+// EVERY limit here counts CODE POINTS, not bytes and not UTF-16 units (#597).
+// The two formatters have to produce the same text for the same page, and they
+// used to disagree the moment a page was not ASCII: Go sliced `snap.Text` by
+// BYTES while the daemon sliced the same field by UTF-16 units, so a CJK page
+// showed roughly 666 characters here against the daemon's 2000 and the two
+// "(N chars truncated)" numbers differed by about three times for one page.
+// Byte slicing also cuts a multi-byte character in half, and the half then
+// reaches the model as U+FFFD. `snapshot_parity_expected.txt` in testdata is
+// the golden rendering both sides are held to, deliberately full of characters
+// that make the three countings disagree.
 const (
 	maxPageText = 2000
 	maxElements = 80
 	maxSameRole = 15
+	// Element fields, cut again here because the snapshot script's own cuts are
+	// UTF-16 units in both scripts and these are code points.
+	maxElementText = 50
+	maxElementHref = 80
+	// Attribute values and the Key Elements labels built from them. The
+	// snapshot script already cuts every attribute at 200 (UTF-16 units, so
+	// never more than 200 code points), which makes this a bound the formatter
+	// holds on its own rather than a second cut of the same value.
+	maxElementAttr = 200
 )
+
+// Caps for the two lines a PAGE writes into the rendered snapshot (#597).
+//
+// `Page:` is `document.title` and `URL:` is `location.href`, both chosen by the
+// page and both previously uncapped -- so a multi-megabyte title pushed the
+// whole reply past the brain's 2 MB event cap (MAX_JSON_SIZE in
+// src/sidecar/validator.ts) and the read was DROPPED: no text, no error, and
+// nothing pointing at the cause. Everything else in this rendering is already
+// bounded (page text above, 80 elements, each attribute cut at 200 by the
+// snapshot script), so these two lines were the whole exposure.
+//
+// TRUNCATED rather than refused, which is the opposite of what #594 does to the
+// identity fields on the wire, and deliberately: those are a value code BRANCHES
+// on, where a shortened URL names a different page and a wrong site playbook is
+// worse than none, while these are prose the model READS, and a shortened title
+// beats a dropped snapshot. Marked visibly so the model can tell.
+//
+// Two numbers, not one. 2048 is generous for a title (a real one is under 200)
+// and far too small for a URL: a Maps link with an encoded polyline, a Looker
+// Studio report state, or an OAuth callback carrying an id_token all exceed it
+// routinely, and this is the line the model copies back into browser_navigate.
+// So the URL line takes `maxWirePageURL`'s NUMBER instead, so that a URL which
+// survives the wire is not cut in the text. One number, two units and two
+// different values: this one counts code points of the page's `location.href`,
+// the wire check counts bytes of the frame tree's URL. They are not a coupling
+// to maintain -- if either side ever needs its own figure, give it a literal
+// and say so here.
+const (
+	maxRenderedTitle = 2048
+	maxRenderedURL   = maxWirePageURL
+	// Everything else a PAGE chooses and a browser reply then carries: a
+	// `browser_evaluate` result, and the `exceptionDetails` a thrown Error
+	// fills. Same failure, same marker, a bigger number because a model asks
+	// `browser_evaluate` for a value rather than for prose (#597).
+	maxPageControlledReply = 20000
+)
+
+// renderedValue prepares a page-controlled value for a single LINE of the
+// rendering: control characters out, then cut to `limit` code points.
+//
+// The strip is the same rule `truncateURL` applies, for the same reason. These
+// fields are single-line BY CONSTRUCTION -- a title, a label, an element's
+// collapsed text -- so a newline in one is a page writing a line of the
+// rendering: `document.title = "x\nURL: https://bank.example"` produced a
+// second, forged `URL:` line, and an `aria-label` carrying a newline forged an
+// element line, inside a block whose every line the model reads as ours.
+//
+// SCOPE, stated because it is easy to over-read. It covers the title, the URL
+// line, the attributes and the element text, and only the C0 range plus DEL:
+// U+0085, U+2028 and U+2029 survive, so a consumer that treats those as line
+// breaks sees more lines than the formatter wrote. That is deliberate -- both
+// formatters emit them identically (see quoteElementText), so removing them
+// would be a second rule to keep in step for a reader nothing here has -- and
+// the `--- Page Text ---` block is legitimately multi-line and is not stripped
+// at all, so a page can still put something that reads like a section header
+// or an `[id]` line into its own body text. Nothing escapes the untrusted
+// block either way; what this buys is that the lines the FORMATTER writes are
+// the formatter's.
+//
+// `renderedValue` in src/actions/tools/builtin.ts is this function.
+func renderedValue(s string, limit int) string {
+	return truncateRunes(stripControlChars(s), limit)
+}
+
+// stripControlChars replaces every run of C0 controls and DEL with ONE space.
+//
+// Replaced rather than deleted, and that matters: a multi-line
+// `aria-label="Send\nnow"` is ordinary authoring, and deleting the newline
+// glues the words into "Sendnow". A space is also what the snapshot scripts
+// already do to the whitespace they collapse (`.replace(/\s+/g, ' ')`), so this
+// is the same rule reaching the characters that rule does not match.
+//
+// Only runs of CONTROL characters collapse. Ordinary runs of spaces in an
+// attribute are left exactly as they are, so a value with no control character
+// in it is returned byte for byte.
+//
+// `stripControlChars` in src/actions/tools/builtin.ts is this function.
+func stripControlChars(s string) string {
+	if !strings.ContainsFunc(s, isControlChar) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	inRun := false
+	for _, r := range s {
+		if isControlChar(r) {
+			if !inRun {
+				b.WriteByte(' ')
+				inRun = true
+			}
+			continue
+		}
+		inRun = false
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func isControlChar(r rune) bool {
+	return r < 0x20 || r == 0x7f
+}
+
+// quoteElementText renders an element's own text as a quoted string.
+//
+// NOT `%q`, which is why this exists. `%q` escapes every rune Go calls
+// non-printable, and the daemon's `JSON.stringify` escapes only `"`, `\` and
+// the C0 range -- so the two formatters disagreed about any code point that is
+// unprintable to Go but ordinary to JSON: a Material Icons or Font Awesome
+// LIGATURE GLYPH in a button's text (private-use, and common), a zero-width
+// space, a soft hyphen, a bidi mark, a C1 byte off a mis-decoded
+// windows-1252 page. Go rendered `""` where the daemon rendered the
+// glyph, on exactly the kind of button a template tells the model to click.
+//
+// So both sides quote the same way: the C0 range is already gone (see
+// stripControlChars), and what is left needs `"` and `\` escaped and nothing
+// else. This is `JSON.stringify` for that input, implemented here rather than
+// relied upon through a formatting verb that answers a different question.
+func quoteElementText(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for _, r := range s {
+		if r == '"' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// truncateMarked cuts a page-controlled value to `limit` code points and says
+// so in place. No strip: this is for a value that is legitimately MULTI-LINE --
+// a `browser_evaluate` result, which is routinely `innerText` or
+// pretty-printed JSON, and an `exceptionDetails` blob. Stripping those would
+// glue every line of a document together, which is a change to what the model
+// reads that has nothing to do with capping it.
+//
+// The marker is appended directly after the value with no leading space, and it
+// reuses the grammar and the quantity the page-text cut above already uses
+// ("chars truncated" = characters REMOVED). One marker grammar across both
+// formatters; `truncateMarked` in src/actions/tools/builtin.ts is this function.
+func truncateMarked(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= limit {
+		return s
+	}
+	return fmt.Sprintf("%s... (%d chars truncated)", string(r[:limit]), len(r)-limit)
+}
+
+// truncateRendered is truncateMarked for a value that must also be ONE LINE:
+// the `Page:` and `URL:` lines, where the cut is the difference between a short
+// title and a dropped snapshot.
+//
+// The count is taken AFTER the strip, so it reports the characters removed from
+// the one-line value, not from the page's original.
+func truncateRendered(s string, limit int) string {
+	return truncateMarked(stripControlChars(s), limit)
+}
 
 // formatBrowserSnapshot is a faithful port of the daemon's formatSnapshot.
 func formatBrowserSnapshot(snap *pageSnapshot) string {
 	var lines []string
-	lines = append(lines, fmt.Sprintf("Page: %s", snap.Title))
-	lines = append(lines, fmt.Sprintf("URL: %s", snap.URL))
+	lines = append(lines, fmt.Sprintf("Page: %s", truncateRendered(snap.Title, maxRenderedTitle)))
+	lines = append(lines, fmt.Sprintf("URL: %s", truncateRendered(snap.URL, maxRenderedURL)))
 	lines = append(lines, "")
 	lines = append(lines, "--- Page Text ---")
-	if len(snap.Text) > maxPageText {
-		lines = append(lines, snap.Text[:maxPageText])
-		lines = append(lines, fmt.Sprintf("... (%d chars truncated)", len(snap.Text)-maxPageText))
+	if text := []rune(snap.Text); len(text) > maxPageText {
+		lines = append(lines, string(text[:maxPageText]))
+		lines = append(lines, fmt.Sprintf("... (%d chars truncated)", len(text)-maxPageText))
 	} else {
 		lines = append(lines, snap.Text)
 	}
@@ -671,12 +1103,12 @@ func formatBrowserSnapshot(snap *pageSnapshot) string {
 			if el.Attrs["contenteditable"] != "" {
 				suffix = " (contenteditable)"
 			}
-			keyLines = append(keyLines, fmt.Sprintf("[%d] INPUT: %s%s", el.ID, label, suffix))
+			keyLines = append(keyLines, fmt.Sprintf("[%d] INPUT: %s%s", el.ID, renderedValue(label, maxElementAttr), suffix))
 		}
 	}
 	for _, el := range shown {
 		if (el.Tag == "button" || el.Attrs["role"] == "button") && el.Attrs["aria-label"] != "" {
-			keyLines = append(keyLines, fmt.Sprintf("[%d] BUTTON: %s", el.ID, el.Attrs["aria-label"]))
+			keyLines = append(keyLines, fmt.Sprintf("[%d] BUTTON: %s", el.ID, renderedValue(el.Attrs["aria-label"], maxElementAttr)))
 		}
 	}
 	if len(keyLines) > 0 {
@@ -690,17 +1122,14 @@ func formatBrowserSnapshot(snap *pageSnapshot) string {
 		var attrParts []string
 		addAttr := func(key, format string) {
 			if v := el.Attrs[key]; v != "" {
-				attrParts = append(attrParts, fmt.Sprintf(format, v))
+				attrParts = append(attrParts, fmt.Sprintf(format, renderedValue(v, maxElementAttr)))
 			}
 		}
 		addAttr("name", `name="%s"`)
 		addAttr("placeholder", `placeholder="%s"`)
 		addAttr("type", `type="%s"`)
 		if href := el.Attrs["href"]; href != "" {
-			if len(href) > 80 {
-				href = href[:80]
-			}
-			attrParts = append(attrParts, fmt.Sprintf(`href="%s"`, href))
+			attrParts = append(attrParts, fmt.Sprintf(`href="%s"`, renderedValue(href, maxElementHref)))
 		}
 		addAttr("aria-label", `aria-label="%s"`)
 		addAttr("role", `role="%s"`)
@@ -710,11 +1139,7 @@ func formatBrowserSnapshot(snap *pageSnapshot) string {
 
 		textStr := ""
 		if el.Text != "" {
-			text := el.Text
-			if len(text) > 50 {
-				text = text[:50]
-			}
-			textStr = fmt.Sprintf(" %q", text)
+			textStr = " " + quoteElementText(renderedValue(el.Text, maxElementText))
 		}
 		attrStr := ""
 		if len(attrParts) > 0 {
@@ -776,17 +1201,19 @@ type pageReply struct {
 // megabytes on its own, so an unbounded field here would be the cheapest way to
 // deny a read.
 //
-// It does NOT make the reply as a whole safe, and the comment used to imply that.
-// `formatBrowserSnapshot` renders `Page: <document.title>` and `URL:
-// <location.href>` with no cap of their own, so a page with a multi-megabyte
-// title can still get its own reads dropped. That predates this change, the
-// daemon's local `formatSnapshot` has the same shape, and capping it is a
-// formatter parity change on both sides rather than part of #583.
+// It does NOT by itself make the reply as a whole safe. The rendered text used
+// to be the other half of that exposure -- `Page: <document.title>` and `URL:
+// <location.href>` had no cap of their own, so a page with a multi-megabyte
+// title got its own reads dropped. #597 closed that in both formatters
+// (`maxRenderedTitle` / `maxRenderedURL` above), so the whole rendering is now
+// bounded; these two fields are bounded here because they travel BESIDE it.
 //
 // Deliberately NOT the daemon's 2048, so nobody reads the two numbers as a
 // coupling to keep in step. An over-long URL is omitted rather than truncated --
 // a truncated identity is a different page, and a wrong playbook is worse than
-// none.
+// none. `maxRenderedURL` reuses this NUMBER (see it for why), but the two are
+// not the same quantity: the check below counts BYTES of the frame-tree URL
+// where the renderer counts code points of the page's `location.href`.
 const (
 	maxWirePageURL  = 4096
 	maxWireLoaderID = 64
@@ -805,14 +1232,14 @@ func wantsPageIdentity(params map[string]any) bool {
 
 // browserPageResult packages a formatted read for whichever brain asked for it.
 //
-// The identity is dropped unless the browser actually named the document. An
-// empty loaderID is the one asymmetry with the daemon's local path: the daemon
-// nulls `browserUrl` unless the loaderId it read is non-empty AND unchanged
-// after the read, while `assertSamePage` compares two empty ids as equal and
-// would let an unnamed document through. A frame tree can be nameless -- a
+// The identity is dropped unless the browser actually named the document. This
+// check predates #603, which made the same rule a property of `assertSamePage`
+// itself -- so an unnamed document no longer reaches here at all on a read that
+// goes through that guard. It stays because this function does not: it packages
+// whatever identity its caller hands it, a frame tree can be nameless (a
 // pre-commit initial document, or a reply whose shape `json.Unmarshal` fills
-// only partly. Refusing here keeps the guarantee the same on both sides, and
-// costs at most one site playbook.
+// only partly), and a field this cheap to re-check should not depend on which
+// guard the caller happened to run. It costs at most one site playbook.
 func browserPageResult(formatted string, id pageIdentity, params map[string]any) *RPCResult {
 	if !wantsPageIdentity(params) {
 		return &RPCResult{Result: formatted}
