@@ -189,12 +189,22 @@ export function createManageWorkflowTool(deps: ManageWorkflowDeps = {}): ToolDef
      * parameter error pays a preamble it does not need; that is the cost of not
      * having the frame depend on a code path.
      *
-     * WHAT THIS DOES NOT DO: it does not make the tool throw anything different.
-     * The message is byte-identical, which is why the ~15 `rejects.toThrow`
-     * assertions across `manage-workflow.test.ts`, `flow-code-steps.test.ts` and
+     * WHAT THIS DOES NOT DO: #608's framing does not make the tool throw
+     * anything different, which is why the ~15 `rejects.toThrow` assertions
+     * across `manage-workflow.test.ts`, `flow-code-steps.test.ts` and
      * `workflow-readiness.test.ts` are untouched, and why `trapErrors` in
      * `workflows/api/routes.ts` still maps a `WorkflowReadinessError` to its own
-     * 4xx with the raw `e.message`. Framing a throw by catching it and returning
+     * 4xx with the raw `e.message`.
+     *
+     * This used to say the message is "byte-identical", and since #633 that is
+     * no longer true of a `WorkflowReadinessError`: its constructor now names at
+     * most 10 issues and cuts each one's `node`, `path` and `message`, so a
+     * refusal from a wide graph or one with long node names is SHORTER than the
+     * text #608 framed. None of those assertions moved -- every fixture behind
+     * them produces exactly one issue, with a node of 7 characters at most --
+     * but the claim belonged to #608's framing, not to the message's content,
+     * and it is corrected here rather than left to mislead the next reader.
+     * Framing a throw by catching it and returning
      * the text -- the shape #607 assumed this fix would take -- would have turned
      * a failure into a success value for every caller, including the workflow
      * runtime, where a rejection is how a step is marked failed. Framing at the
@@ -461,11 +471,17 @@ export function createManageWorkflowTool(deps: ManageWorkflowDeps = {}): ToolDef
  * What is left, deliberately. Two operator-facing cuts read the RAW result and
  * are not model boundaries, so they keep a dangling open line and that is the
  * right call: `daemon/index.ts`'s `[EXECUTED]` notification and the approval
- * execute route in `daemon/api-routes.ts`. And `runtime/piece-effects.ts`'s
- * `bound()` cuts a governed piece's input strings to 512 for review -- a flow
- * author can wire this tool's framed result into one with `{{ }}` -- but that
- * projection feeds the re-authorize digest, so changing it invalidates
- * in-flight approvals and wants its own issue rather than a change here.
+ * execute route in `daemon/api-routes.ts`.
+ *
+ * The third item here used to be `runtime/piece-effects.ts`'s `bound()`, which
+ * cuts a governed piece's input strings to 512 for review -- a flow author can
+ * wire this tool's framed result into one with `{{ }}`. That is now CLOSED by
+ * #634, on the daemon side, by `runtime/piece-effect-receipt.ts`. The
+ * invalidation cost this comment worried about was real and was paid: a pending
+ * governed-piece approval whose input carries a marker spelling, or ill-formed
+ * UTF-16, fails its `requestDigest` fence on resume and its run must be
+ * restarted. Every other projection is byte-identical, which
+ * `governed-pieces.test.ts` pins against a fixed digest.
  */
 const FRAMED_PAYLOAD_MAX_CHARS = 4000;
 
