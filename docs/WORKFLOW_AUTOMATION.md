@@ -1090,11 +1090,11 @@ Mounted under `/api/workflows/*`. Source: `src/workflows/api/routes.ts`.
 | GET | `/api/workflows/:id/versions` | Version history |
 | POST | `/api/workflows/:id/versions` | New draft version. `{ displayName, trigger?, uiMeta? }` |
 | GET | `/api/workflows/:id/versions/:vid` | Get version + its `uiMeta` |
-| PATCH | `/api/workflows/:id/versions/:vid` | Edit a draft: `displayName`, `trigger`, `connectionIds`, `agentIds`, `uiMeta` (picked, not spread; other keys are ignored). Refused for a LOCKED version, today as a 500 |
+| PATCH | `/api/workflows/:id/versions/:vid` | Edit a draft: `displayName`, `trigger`, `connectionIds`, `agentIds`, `uiMeta` (picked, not spread; other keys are ignored). Refused for a LOCKED version (409) |
 | GET | `/api/workflows/:id/versions/:vid/readiness` | Readiness report for one version |
 | POST | `/api/workflows/:id/versions/:vid/lock` | Freeze a draft (DRAFT -> LOCKED). Gated on readiness (422 with the readiness report); may answer with `osWarnings`. Does not publish and does not refresh triggers |
 | PATCH | `/api/workflows/:id/versions/:vid/sample-data/:step` | Set one step's sample output, `{ output }`; `output` absent or null removes the entry |
-| DELETE | `/api/workflows/:id/versions/:vid/sample-data/:step` | Clear the version's WHOLE sample-data map. `:step` is required by the path and ignored |
+| DELETE | `/api/workflows/:id/versions/:vid/sample-data/:step` | Clear the version's WHOLE sample-data map. `:step` is required by the path and ignored. Refused for a LOCKED version (409) |
 | PATCH | `/api/workflows/:id/versions/:vid/sample-input/:step` | Set one step's sample input override, `{ input }` (a JSON object; absent or null removes it) |
 | POST | `/api/workflows/:id/publish` | Publish the latest draft, or `{ versionId }` (403 when the version has a CODE step and CODE is off for the flow) |
 | POST | `/api/workflows/:id/code-steps` | Grant or revoke this flow's CODE-step permission (`{"enabled": bool}`, required) |
@@ -1110,8 +1110,8 @@ Mounted under `/api/workflows/*`. Source: `src/workflows/api/routes.ts`.
 | DELETE | `/api/workflows/pieces/library/:id` | Uninstall a community piece |
 | GET | `/api/workflows/connections` | Connections in the default project (no secrets) plus the registered Jarvis sources: `{ connections, jarvisSources }` |
 | POST | `/api/workflows/connections` | Create, or replace by `(pieceName, externalId)`, a connection (encrypted). `{ externalId, displayName, type, pieceName, pieceVersion?, value }` |
-| PATCH | `/api/workflows/connections/:id` | Update that connection in place: `displayName`, `value` (full replacement), `status`. Rotates a token without the delete-then-recreate gap |
-| DELETE | `/api/workflows/connections/:id` | Delete the stored connection. Revokes nothing at the provider |
+| PATCH | `/api/workflows/connections/:id` | Update that connection in place: `displayName`, `value` (full replacement), `status`. Rotates a token without the delete-then-recreate gap. 404 for an id outside the default project, the same as for an id that does not exist |
+| DELETE | `/api/workflows/connections/:id` | Delete the stored connection. Revokes nothing at the provider. 404 for an id outside the default project, the same as for an id that does not exist |
 | GET | `/api/workflows/triggers` | Active trigger registrations |
 | GET | `/api/workflows/events/buffer-stats` | Event buffer health (dropped count, capacity) |
 | GET, POST | `/api/webhooks/:flowId` | Engine-managed webhook trigger fan-in (503 when webhooks are not enabled in the build) |
@@ -1149,7 +1149,7 @@ empty or whitespace-only body reads as `{}`.
 |---|---|---|
 | `POST /api/workflows`, `PATCH /api/workflows/:id` | 262,144 bytes | `displayName` required on POST, at most 512 characters (413). `metadata` a JSON object or null, at most 16,384 characters serialized (413), no `__proto__` / `constructor` / `prototype` key (400). `status` must be `ENABLED` or `DISABLED` (400) |
 | `POST /api/workflows/:id/versions`, `PATCH .../versions/:vid` | 4,000,000 bytes | `displayName` at most 512 characters (413). `uiMeta` shape-checked (400). PATCH only: `connectionIds` / `agentIds` arrays of strings (400), at most 100 entries each and 256 characters an entry (413); the POST ignores both |
-| `PATCH .../sample-data/:step`, `PATCH .../sample-input/:step` | 2,000,000 bytes | `:step` at most 120 characters (413) and not `__proto__` / `prototype` / `constructor` (400). One entry at most 262,144 characters serialized (413). The whole map at most 100 entries and 4,194,304 characters serialized, keys included (413); a write that shrinks an over-limit map is always allowed. A LOCKED version is refused, today as a 500 (the repo throws a plain `Error`) |
+| `PATCH .../sample-data/:step`, `PATCH .../sample-input/:step` | 2,000,000 bytes | `:step` at most 120 characters (413) and not `__proto__` / `prototype` / `constructor` (400). One entry at most 262,144 characters serialized (413). The whole map at most 100 entries and 4,194,304 characters serialized, keys included (413); a write that shrinks an over-limit map is always allowed. A LOCKED version is refused (409) |
 | `POST /api/workflows/:id/publish` | 262,144 bytes | Empty, `{}` or `{ versionId }` with a non-empty string (400 otherwise) |
 | `POST /api/workflows/:id/code-steps` | 262,144 bytes | `enabled` must be a boolean (400) |
 | `POST /api/workflows/:id/run` | 1,000,000 bytes | `environment` must be `PRODUCTION` or `TESTING` (400). `triggeredBy` a string of at most 200 characters (400). `workItemId` must come alone (400) |
