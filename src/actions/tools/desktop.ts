@@ -12,7 +12,7 @@
 import type { AppController, UIElement, WindowInfo } from '../app-control/interface.ts';
 import { getAppController } from '../app-control/interface.ts';
 import type { ToolDefinition, ToolResult } from './registry.ts';
-import { routeToSidecarAction as routeToSidecar, resolveToolTarget } from './sidecar-route.ts';
+import { routeToSidecarAction as routeToSidecar, routeScreenshotToSidecar, resolveToolTarget } from './sidecar-route.ts';
 import { ActionOutcomeError } from '../action-outcome.ts';
 import type { SidecarCapability } from '../../sidecar/types.ts';
 
@@ -375,12 +375,15 @@ export const desktopClickTool: ToolDefinition = {
     // The enum is ENFORCED by ToolRegistry, not just advertised, so it is a
     // gate: an action the sidecar gains but this list does not is unreachable
     // from the agent. The accepted set lives in the sidecar (Go), with no
-    // shared TS definition to pin this to, so add new actions in both places.
+    // shared TS definition, so add new actions in both places --
+    // tool-enums.test.ts parses the three Go switches and fails if this list
+    // and their union differ in either direction (#657: `get_text` sat here
+    // for every platform while no switch had a case for it).
     action: {
       type: 'string',
-      description: 'Action to perform (default click). invoke/toggle/select/set_value/get_value/get_text/expand/collapse/scroll_into_view are Windows-only; macOS and Linux support click/double_click/right_click/focus.',
+      description: 'Action to perform (default click). invoke/toggle/select/set_value/get_value/expand/collapse/scroll_into_view are Windows-only; macOS and Linux support click/double_click/right_click/focus.',
       required: false,
-      enum: ['click', 'double_click', 'right_click', 'invoke', 'toggle', 'select', 'set_value', 'get_value', 'get_text', 'expand', 'collapse', 'scroll_into_view', 'focus'],
+      enum: ['click', 'double_click', 'right_click', 'invoke', 'toggle', 'select', 'set_value', 'get_value', 'expand', 'collapse', 'scroll_into_view', 'focus'],
     },
     value: {
       type: 'string',
@@ -422,9 +425,10 @@ export const desktopClickTool: ToolDefinition = {
  * `{success: true}` elsewhere for type_text, `{success, keys}` for press_keys
  * plus our own `xdotool_combo` conversion of those keys on Linux -- the
  * model's own arguments and our own rendering of them -- and, for
- * capture_screen, an image on the local branch and a reply of our own
- * measurements (`{captured, bytes, mime, width, height, ...}` plus the base64
- * the manager staples on) over the sidecar. No remote text on either.
+ * capture_screen, an image on both branches: since #658 the sidecar branch
+ * returns the image block plus one sentence of our own built from the reply's
+ * validated width and height (`routeScreenshotToSidecar`), where it used to
+ * stringify the whole reply, base64 and all. No remote text on either.
  *
  * Their FAILURES are a different matter, and the reason all nine of these tools
  * need something: with a `target` they dispatch through `routeToSidecarAction`,
@@ -599,7 +603,8 @@ export const desktopScreenshotTool: ToolDefinition = {
   execute: async (params) => {
     const target = resolveDesktopTarget(params.target, 'screenshot', 'desktop_screenshot');
     if (target) {
-      return routeToSidecar(target, 'capture_screen', params, 'screenshot');
+      // The picture, as the local branch below returns it (#658).
+      return routeScreenshotToSidecar(target, params, true);
     }
     return executeLocal(async (controller) => {
       let base64: string;
