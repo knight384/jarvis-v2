@@ -100,6 +100,18 @@ describe('typed desktop outcomes', () => {
     });
   });
 
+  test('a click refused because another window covers the element is not started (#705)', async () => {
+    // sidecar/desktop_linux.go and uia_actions_windows.go check the window under
+    // the element's centre before any button goes down.
+    setSidecarManagerRef(stubManager([mac], async () => {
+      throw new SidecarRPCError('DESKTOP_TARGET_OBSCURED',
+        'element [3] is covered by a window of another program (pid 9999, not 4242) at its centre (40, 50), so nothing was clicked.');
+    }));
+    await expect(routeToSidecarAction(mac.id, 'click_element', { element_id: 3 }, 'desktop')).rejects.toMatchObject({
+      outcome: { status: 'error', code: 'DESKTOP_TARGET_OBSCURED', effect: 'not_started' },
+    });
+  });
+
   /**
    * #623, the brain half. The sidecar now answers a panicking handler with
    * `HANDLER_PANIC` instead of dropping the socket, and the question this pins
@@ -641,6 +653,26 @@ describe('a routed screenshot delivers an image (#658)', () => {
     expect(out.content[1]).toMatchObject({ type: 'image' });
   });
 
+  // #710: the sidecar's capture_screen has no window capture, so a routed
+  // desktop_screenshot({pid}) used to come back as the WHOLE desktop with
+  // nothing saying so. Refused before anything is captured instead: the other
+  // windows' pixels never leave the machine on a request that named one window.
+  test('a routed desktop_screenshot with a pid is refused before any capture', async () => {
+    let calls = 0;
+    setSidecarManagerRef(stubManager([shooter], async () => { calls++; return reply({ type: 'inline', mime_type: 'image/png', data: PIXELS }); }));
+    // pid 0 too, so a later `if (params.pid)` cannot reopen this.
+    for (const pid of [4242, 0]) {
+      const err = await rejection(() => screenshotTools()[0]!.execute({ target: shooter.id, pid }));
+      expect(err.outcome).toMatchObject({ status: 'blocked', code: 'SCREENSHOT_WINDOW_UNSUPPORTED', effect: 'not_started' });
+      expect(err.message).toContain('without pid');
+    }
+    expect(calls).toBe(0);
+    // Without a pid it is the ordinary whole-desktop capture.
+    const out = await screenshotTools()[0]!.execute({ target: shooter.id }) as ToolResult;
+    expect(out.content[1]).toMatchObject({ type: 'image' });
+    expect(calls).toBe(1);
+  });
+
   // A raw PNG of a large display can pass guardImageSize's 5 MB cap, and the
   // orchestrator then swaps the image for a placeholder -- no picture again. So
   // an over-cap capture is retaken compacted, once, with the daemon's own
@@ -707,6 +739,36 @@ describe('a routed screenshot delivers an image (#658)', () => {
           { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PIXELS } },
         ],
       });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // #711: the same local branch with a capture over the cap. A raw PNG used
+  // to go out as-is and reach the model as `[Image too large...]`.
+  test.skipIf(process.platform !== 'linux')('capture_screen without a sidecar compacts an over-cap capture', async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { encodePng, noiseRgbRows } = await import('../app-control/fixtures/png.ts');
+    const dir = mkdtempSync(join(tmpdir(), 'jarvis-fake-scrot-'));
+    try {
+      const png = join(dir, 'shot.png');
+      const bytes = encodePng(2000, 1000, 2, 8, noiseRgbRows(2000, 1000));
+      expect(bytes.toString('base64').length).toBeGreaterThan(5 * 1024 * 1024);
+      writeFileSync(png, bytes);
+      writeFileSync(join(dir, 'scrot'), `#!/bin/sh\nexec /bin/cp '${png}' "$1"\n`, { mode: 0o755 });
+      const builtin = new URL('./builtin.ts', import.meta.url).pathname;
+      const script = `const { captureScreenTool } = await import(${JSON.stringify(builtin)});\n`
+        + `process.stdout.write(JSON.stringify(await captureScreenTool.execute({})));`;
+      const child = Bun.spawnSync(['bun', '-e', script], {
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+      });
+      expect({ exitCode: child.exitCode, stderr: child.stderr.toString() }).toMatchObject({ exitCode: 0 });
+      const out = JSON.parse(child.stdout.toString());
+      expect(out.content[0]).toEqual({ type: 'text', text: 'Screenshot captured (1600x800, downscaled from 2000x1000 to fit).' });
+      expect(out.content[1].source.media_type).toBe('image/jpeg');
+      expect(out.content[1].source.data.length).toBeLessThanOrEqual(5 * 1024 * 1024);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

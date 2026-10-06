@@ -21,6 +21,7 @@ import { compareSemver, parseSemver } from '../../sidecar/compat.ts';
 import { getMachineScope } from '../machine-scope.ts';
 import type { ToolResult } from './registry.ts';
 import { guardImageSize, type ContentBlock } from '../../llm/provider.ts';
+import { SCREENSHOT_COMPACT } from '../app-control/image-compact.ts';
 
 let sidecarManager: SidecarManager | null = null;
 
@@ -53,8 +54,14 @@ let sidecarManager: SidecarManager | null = null;
  * it could not re-read. Each is returned before the first click, keystroke or
  * pattern call, which `desktop_element_stale_linux_test.go` pins by checking
  * that no pointer or keyboard command ran.
+ *
+ * `DESKTOP_TARGET_OBSCURED` (#705) is a click refused because the window under
+ * the element's centre is not the element's own: covered, minimised, on another
+ * workspace. Returned before any button goes down; on Linux the pointer has
+ * moved to look (`desktop_pointer_target_linux_test.go` pins that nothing was
+ * clicked), on Windows it has not (uia_element_guard_windows_test.go).
  */
-const NOT_STARTED_RPC_CODES = new Set(['DESKTOP_INVALID_KEYS', 'DESKTOP_STALE_ELEMENT']);
+const NOT_STARTED_RPC_CODES = new Set(['DESKTOP_INVALID_KEYS', 'DESKTOP_STALE_ELEMENT', 'DESKTOP_TARGET_OBSCURED']);
 
 /**
  * Inject the sidecar manager at startup. Called once from the daemon.
@@ -620,7 +627,9 @@ const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
  * and a coordinate overlay drawn over a general-purpose screenshot is noise
  * the model would read as screen content.
  */
-const COMPACT_CAPTURE = { compact: true, max_width: 1600, jpeg_quality: 80, grid: false } as const;
+const COMPACT_CAPTURE = {
+  compact: true, max_width: SCREENSHOT_COMPACT.maxWidth, jpeg_quality: SCREENSHOT_COMPACT.jpegQuality, grid: false,
+} as const;
 
 type SidecarImage = { mediaType: string; data: string; width: number; height: number; origWidth: number; origHeight: number };
 

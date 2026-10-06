@@ -15,6 +15,8 @@ import type { ToolDefinition, ToolResult } from './registry.ts';
 import { routeToSidecarAction as routeToSidecar, routeScreenshotToSidecar, resolveToolTarget } from './sidecar-route.ts';
 import { ActionOutcomeError } from '../action-outcome.ts';
 import type { SidecarCapability } from '../../sidecar/types.ts';
+import { screenshotCaption, screenshotForModel } from '../app-control/image-compact.ts';
+import { ElementCache, resolveElement, uiElementPrint } from '../app-control/element-cache.ts';
 
 /**
  * Resolve the desktop-tool target. If the LLM passed an explicit
@@ -75,8 +77,27 @@ type SnapshotCapableController = AppController & {
 };
 
 let localControllerFactory: () => AppController = () => getAppController();
-let localElementCache = new Map<number, UIElement>();
+/**
+ * The last local tree walk's elements, behind ids that name that walk, and
+ * re-checked against a fresh walk before any action (#704, element-cache.ts).
+ */
+let localElements = new ElementCache<UIElement>();
 let lastLocalSnapshot: LocalSnapshot | null = null;
+
+/**
+ * Local element work, one call at a time: a snapshot, a find, and the
+ * read-back plus dispatch of a click or a type. A legacy desktop bridge keeps
+ * its own per-walk ids, so a walk that lands between an action's read-back and
+ * its click would re-point the id the click goes out under. The tools are
+ * driven one at a time by a model anyway; this makes it a property of the code
+ * rather than of the caller.
+ */
+let localElementQueue: Promise<unknown> = Promise.resolve();
+function serializedLocal<T>(fn: () => Promise<T>): Promise<T> {
+  const run = localElementQueue.then(fn, fn);
+  localElementQueue = run.catch(() => undefined);
+  return run;
+}
 
 export function __setLocalDesktopControllerFactoryForTests(factory: (() => AppController) | null): void {
   localControllerFactory = factory ?? (() => getAppController());
@@ -84,7 +105,7 @@ export function __setLocalDesktopControllerFactoryForTests(factory: (() => AppCo
 }
 
 export function __resetLocalDesktopStateForTests(): void {
-  localElementCache.clear();
+  localElements = new ElementCache<UIElement>();
   lastLocalSnapshot = null;
 }
 
@@ -97,6 +118,27 @@ function isToolDisabled(): string | null {
 
 function getLocalController(): SnapshotCapableController {
   return localControllerFactory() as SnapshotCapableController;
+}
+
+/**
+ * A local capture as the model should receive it (#711): full resolution when
+ * it fits under `guardImageSize`'s cap, otherwise compacted with the routed
+ * fallback's values (app-control/image-compact.ts), and a failure -- never a
+ * placeholder -- when even that does not fit. `label` is the tool's own
+ * sentence; it gains the picture's size only when the picture was shrunk.
+ *
+ * `typedErrors` as in `routeScreenshotToSidecar`: the desktop tools throw a
+ * typed failure (not_started: a capture changes nothing on the machine), the
+ * legacy `capture_screen` returns the message.
+ */
+export function localScreenshotResult(base64: string, mediaType: string, label: string, typedErrors: boolean): ToolResult | string {
+  const shot = screenshotForModel(base64, mediaType);
+  if (!shot.ok) {
+    const message = `Error: the screenshot is too large to send, and ${shot.reason}, so there is nothing to look at.`;
+    if (typedErrors) throw new ActionOutcomeError({ status: 'error', code: 'LOCAL_IMAGE_TOO_LARGE', message, effect: 'not_started' });
+    return message;
+  }
+  return { content: [{ type: 'text', text: screenshotCaption(label, shot) }, shot.block] };
 }
 
 function formatBounds(bounds: WindowInfo['bounds']): string {
@@ -116,38 +158,58 @@ function formatWindows(windows: WindowInfo[]): string {
     .join('\n');
 }
 
+/**
+ * A tree in depth-first pre-order, down to `depthLimit`. The order is what an
+ * element's index -- and so its id -- means, so a snapshot and the read-back
+ * before an action must both come through here with the same limit.
+ */
 function flattenElements(
   elements: UIElement[],
   depthLimit: number,
   depth: number,
-  flattened: FlatSnapshotElement[],
-): void {
+  flattened: Array<{ element: UIElement; depth: number }>,
+): Array<{ element: UIElement; depth: number }> {
   if (depth > depthLimit) {
-    return;
+    return flattened;
   }
 
   for (const element of elements) {
-    const numericId = flattened.length + 1;
-    localElementCache.set(numericId, element);
-    flattened.push({
-      id: numericId,
-      role: element.role,
-      name: element.name,
-      value: element.value,
-      depth,
-      bounds: element.bounds,
-      properties: element.properties,
-    });
-
+    flattened.push({ element, depth });
     if (element.children.length > 0) {
       flattenElements(element.children, depthLimit, depth + 1, flattened);
     }
   }
+  return flattened;
+}
+
+/**
+ * One walk of `pid`: the tree, and which window it read when the controller
+ * can say (a bridge walks the pid's largest window, which can change).
+ */
+async function readWindowTree(controller: SnapshotCapableController, pid: number): Promise<{ elements: UIElement[]; context?: string }> {
+  if (typeof controller.getWindowTreeContext === 'function') return controller.getWindowTreeContext(pid);
+  return { elements: await controller.getWindowTree(pid) };
+}
+
+/** One walk of `pid`, flattened as a snapshot numbers it. */
+async function walkLocalElements(controller: SnapshotCapableController, pid: number, depth: number): Promise<{ elements: UIElement[]; context?: string }> {
+  const tree = await readWindowTree(controller, pid);
+  return { elements: flattenElements(tree.elements, depth, 0, []).map((entry) => entry.element), context: tree.context };
 }
 
 async function buildLocalSnapshot(controller: SnapshotCapableController, pid?: number, depth: number = 8): Promise<LocalSnapshot> {
-  localElementCache.clear();
+  try {
+    return await buildLocalSnapshotInner(controller, pid, depth);
+  } catch (err) {
+    // A walk that fails retires the ids the last one handed out (#704), as
+    // the sidecar's forget does: "only the latest snapshot's ids" must hold
+    // for a snapshot that did not work too.
+    localElements.forget();
+    throw err;
+  }
+}
 
+async function buildLocalSnapshotInner(controller: SnapshotCapableController, pid: number | undefined, depth: number): Promise<LocalSnapshot> {
   if (typeof controller.snapshot === 'function') {
     const snap = await controller.snapshot(pid, depth);
     lastLocalSnapshot = {
@@ -177,9 +239,24 @@ async function buildLocalSnapshot(controller: SnapshotCapableController, pid?: n
     throw new Error(`No window found for PID ${pid}`);
   }
 
-  const elements = await controller.getWindowTree(window.pid);
+  const tree = await readWindowTree(controller, window.pid);
+  const walked = flattenElements(tree.elements, depth, 0, []);
+  const ids = localElements.fill({ elements: walked.map((entry) => entry.element), context: tree.context }, window.pid, depth);
   const flattened: FlatSnapshotElement[] = [];
-  flattenElements(elements, depth, 0, flattened);
+  walked.forEach(({ element, depth: elementDepth }, i) => {
+    const id = ids[i];
+    // Past the id stride an element is listed nowhere rather than addressed wrongly.
+    if (id === null || id === undefined) return;
+    flattened.push({
+      id,
+      role: element.role,
+      name: element.name,
+      value: element.value,
+      depth: elementDepth,
+      bounds: element.bounds,
+      properties: element.properties,
+    });
+  });
 
   lastLocalSnapshot = {
     window: { pid: window.pid, title: window.title, className: window.className },
@@ -223,16 +300,16 @@ function formatSnapshot(snapshot: LocalSnapshot): string {
  * to label-only narration).
  */
 export function getCachedElementBounds(elementId: number): UIElement['bounds'] | null {
-  const el = localElementCache.get(elementId);
-  return el?.bounds ?? null;
+  return localElements.lookup(elementId)?.element.bounds ?? null;
 }
 
-function ensureCachedElement(elementId: number): UIElement {
-  const element = localElementCache.get(elementId);
-  if (!element) {
-    throw new Error(`Element [${elementId}] not found. Run desktop_snapshot first.`);
-  }
-  return element;
+/**
+ * The element an id names, as a fresh walk of the same window finds it, or a
+ * `not_started` refusal (#704). What is clicked is that live element, never
+ * the cached copy.
+ */
+function confirmedLocalElement(controller: SnapshotCapableController, elementId: number): Promise<UIElement> {
+  return resolveElement(localElements, elementId, (pid, depth) => walkLocalElements(controller, pid, depth), uiElementPrint);
 }
 
 function withAction(element: UIElement, action?: string): UIElement {
@@ -348,12 +425,15 @@ export const desktopSnapshotTool: ToolDefinition = {
   execute: async (params) => {
     const target = resolveDesktopTarget(params.target, 'desktop', 'desktop_snapshot');
     if (target) {
+      // A snapshot taken elsewhere is now the latest one, so the last local
+      // snapshot's ids are not current any more (#704 review).
+      localElements.forget();
       return routeToSidecar(target, 'get_window_tree', params, 'desktop');
     }
-    return executeLocal(async (controller) => {
+    return executeLocal((controller) => serializedLocal(async () => {
       const snapshot = await buildLocalSnapshot(controller, params.pid as number | undefined, (params.depth as number | undefined) ?? 8);
       return formatSnapshot(snapshot);
-    });
+    }));
   },
 };
 
@@ -396,7 +476,7 @@ export const desktopClickTool: ToolDefinition = {
     if (target) {
       return routeToSidecar(target, 'click_element', params, 'desktop');
     }
-    return executeLocal(async (controller) => {
+    return executeLocal((controller) => serializedLocal(async () => {
       const action = (params.action as string | undefined) ?? 'click';
       if (!['click', 'double_click', 'right_click', 'focus'].includes(action)) {
         return unsupportedAction(action);
@@ -407,10 +487,10 @@ export const desktopClickTool: ToolDefinition = {
         }
         return controller.clickById(params.element_id as number);
       }
-      const element = withAction(ensureCachedElement(params.element_id as number), action);
+      const element = withAction(await confirmedLocalElement(controller, params.element_id as number), action);
       await controller.clickElement(element);
       return `Clicked element [${params.element_id}] with action "${action}".`;
-    });
+    }));
   },
 };
 
@@ -488,13 +568,13 @@ export const desktopTypeTool: ToolDefinition = {
     if (target) {
       return routeToSidecar(target, 'type_text', params, 'desktop');
     }
-    return executeLocal(async (controller) => {
+    return executeLocal((controller) => serializedLocal(async () => {
       const elementId = params.element_id as number | undefined;
       if (typeof controller.typeById === 'function') {
         return controller.typeById(elementId, params.text as string);
       }
       if (elementId !== undefined) {
-        await controller.clickElement(ensureCachedElement(elementId));
+        await controller.clickElement(await confirmedLocalElement(controller, elementId));
         await Bun.sleep(100);
       }
       const text = params.text as string;
@@ -509,7 +589,7 @@ export const desktopTypeTool: ToolDefinition = {
       return elementId !== undefined
         ? `Typed "${text}" into element [${elementId}].`
         : `Typed "${text}".`;
-    });
+    }));
   },
 };
 
@@ -596,13 +676,25 @@ export const desktopScreenshotTool: ToolDefinition = {
     },
     pid: {
       type: 'number',
-      description: 'Process ID of window to capture. Omit for full desktop screenshot.',
+      description: 'Process ID of window to capture. Honoured only when the screenshot is taken on this machine without a sidecar: whenever it goes to a sidecar, including one picked automatically when no target is given, a pid is refused, because a sidecar captures the whole screen. Omit for full desktop screenshot.',
       required: false,
     },
   },
   execute: async (params) => {
     const target = resolveDesktopTarget(params.target, 'screenshot', 'desktop_screenshot');
     if (target) {
+      // A sidecar's capture_screen has no window capture and used to ignore
+      // `pid`, so a request for ONE window came back as the whole desktop with
+      // nothing saying so (#710). Refused rather than widened or captioned:
+      // whatever else is on that screen -- another app, a password manager --
+      // was never asked for, and once its pixels are in a provider request
+      // there is no taking them back. Refusing costs the model one more call
+      // if it does want the whole desktop, and makes that its decision.
+      if (params.pid !== undefined && params.pid !== null) {
+        throw new ActionOutcomeError({ status: 'blocked', code: 'SCREENSHOT_WINDOW_UNSUPPORTED', effect: 'not_started',
+          message: 'Error: a sidecar can only capture the whole screen, not one window, so nothing was captured. '
+            + 'Call desktop_screenshot without pid if the whole screen is what you need, or use desktop_snapshot with this pid to read that window\'s elements.' });
+      }
       // The picture, as the local branch below returns it (#658).
       return routeScreenshotToSidecar(target, params, true);
     }
@@ -621,12 +713,7 @@ export const desktopScreenshotTool: ToolDefinition = {
         base64 = buffer.toString('base64');
       }
 
-      return {
-        content: [
-          { type: 'text' as const, text: 'Desktop screenshot captured.' },
-          { type: 'image' as const, source: { type: 'base64' as const, media_type: mimeType, data: base64 } },
-        ],
-      } satisfies ToolResult;
+      return localScreenshotResult(base64, mimeType, 'Desktop screenshot captured', true);
     });
   },
 };
@@ -698,15 +785,17 @@ export const desktopFindElementTool: ToolDefinition = {
   execute: async (params) => {
     const target = resolveDesktopTarget(params.target, 'desktop', 'desktop_find_element');
     if (target) {
+      // Same as desktop_snapshot: a find elsewhere mints the current ids.
+      localElements.forget();
       return routeToSidecar(target, 'find_element', params, 'desktop');
     }
-    return executeLocal(async (controller) => {
+    return executeLocal((controller) => serializedLocal(async () => {
       if (!params.name && !params.control_type && !params.automation_id && !params.class_name) {
         throw new Error('At least one search filter is required.');
       }
       const snapshot = await buildLocalSnapshot(controller, params.pid as number | undefined);
       return formatElementMatches(snapshot.elements.filter((element) => matchesElement(element, params)));
-    });
+    }));
   },
 };
 
