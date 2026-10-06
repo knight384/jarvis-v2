@@ -36,6 +36,7 @@ import { UPSTREAM_PIN_SHA, UPSTREAM_PIN_TAG } from "../../activepieces/upstream-
 import { ENGINE_LIFECYCLE_SHIM } from "./engine-lifecycle";
 import { sanitizedEnv } from "../../../util/subprocess-env";
 import { BUN_INSTALL_ARGS, SANITIZED_INSTALL_HINT } from "../../../util/sanitized-install";
+import { pinVerifiedBundle, sha256OfFile } from "./bundle-integrity";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -525,8 +526,13 @@ type SharedBundleLookup =
  * disclaim whatever follows. Same reasoning as `boundedReceiptText` (#634),
  * done locally because this module is the engine BUILDER and must not grow an
  * import into the daemon's role machinery.
+ *
+ * Exported only so `log-safe-path.probe.test.ts` can hold it to the same probe
+ * vector as the daemon's `inlineUntrusted` / `defangDelimiters` (#674): the two
+ * are deliberately separate implementations, so a shared test is what stops
+ * this copy drifting. Change one, run that test.
  */
-function logSafePath(value: string): string {
+export function logSafePath(value: string): string {
   // `Zl`/`Zp` as well as `Cc`/`Cf`: U+2028 LINE SEPARATOR and U+2029 PARAGRAPH
   // SEPARATOR are line terminators to a JavaScript parser and to several log
   // shippers, and neither is a control or format character, so the first two
@@ -617,14 +623,18 @@ function refuseSharedBundle(bundlePath: string, reason: string, detail: string):
  * check (a truncated copy, a bad layer pull, a tree published without its
  * digest) where it used to be opt-in, and the removal of a fail-open.
  *
- * ALSO NOT execution-time integrity. Verification happens once, HERE, at
- * resolution; the path is then carried on the `EngineRuntime` and spawned many
- * times over the daemon's whole life, re-read from disk each time, with no
- * re-verification. `piece-catalog`'s cache key re-hashes the same file with no
- * manifest check at all. So the window between check and use is the daemon's
- * lifetime, not microseconds, and requiring the manifest does not narrow it.
- * Closing that is re-hashing in `spawnEngine`, or an immutable mount, and is
- * its own issue.
+ * EXECUTION-TIME INTEGRITY is pinned, not re-derived (#671). Verification
+ * happens once, HERE, at resolution, and the path is then carried on the
+ * `EngineRuntime` and spawned many times over the daemon's whole life. So a hit
+ * pins the digest it just computed (`pinVerifiedBundle`), and `spawnEngine`
+ * re-hashes the file and refuses bytes that differ -- which narrows the window
+ * between check and use from the daemon's lifetime to the spawn itself. It
+ * does not close it (the engine opens the file after the check, and modules it
+ * leaves external are resolved from beside it -- see bundle-integrity.ts);
+ * that is an immutable mount. `piece-catalog`'s cache key also re-hashes this
+ * file with no manifest check. That executes nothing: on a cache miss the
+ * metadata is extracted by an engine `spawnEngine` checks, and on a hit no
+ * engine runs and the key is computed at boot, right after this verification.
  *
  * COST, scoped honestly: zero for in-tree producers. Both write the manifest
  * unconditionally in the same step as the bundle --
@@ -677,7 +687,7 @@ function findSharedBundle(sharedRoot?: string | null): SharedBundleLookup {
   let got: string;
   try {
     want = manifestDigest(readFileSync(manifestPath, "utf8"));
-    got = createHash("sha256").update(readFileSync(bundlePath)).digest("hex");
+    got = sha256OfFile(bundlePath);
   } catch (err) {
     // `err instanceof Error ? err.message : String(err)`, the shape used
     // everywhere else, and not `String((err as Error).message)`: that cast
@@ -698,6 +708,10 @@ function findSharedBundle(sharedRoot?: string | null): SharedBundleLookup {
     return refuseSharedBundle(bundlePath, "digest_mismatch",
       `manifest says ${shown}, bytes hash to ${got}`);
   }
+  // Pin the digest that just verified, so every later spawn of this path is
+  // checked against THESE bytes and not merely against whatever the manifest
+  // beside them says by then (#671, bundle-integrity.ts).
+  pinVerifiedBundle(bundlePath, got);
   return { kind: "hit", bundle: { bundlePath, hash, bundleDir } };
 }
 
@@ -711,9 +725,16 @@ function findSharedBundle(sharedRoot?: string | null): SharedBundleLookup {
  * the install tree + compiled-in constants; the old `STAGING_DIR/package.json`
  * guard was unsound and forced a pointless per-user staging install before a
  * prebuilt bundle could even be discovered.
+ *
+ * `bundleRoot` overrides the per-user cache root (default BUNDLE_ROOT,
+ * `~/.jarvis/cache/engine`), mirroring `sharedRoot` (#673). Production never
+ * passes it; it exists so the per-user cache's contract -- a bundle with NO
+ * manifest beside it is still returned -- can be asserted on behaviour, without
+ * a unit test seeding the developer's own cache.
  */
 export function findCachedBundle(opts?: {
   sharedRoot?: string | null;
+  bundleRoot?: string;
 }): { bundlePath: string; hash: string } | null {
   const shared = findSharedBundle(opts?.sharedRoot);
   if (shared.kind === "hit") return { bundlePath: shared.bundle.bundlePath, hash: shared.bundle.hash };
@@ -723,7 +744,7 @@ export function findCachedBundle(opts?: {
   // level. The caller's `buildEngineBundle` then BUILDS rather than adopts.
   if (shared.kind === "refused") return null;
   const hash = bundleHash();
-  const bundleDir = resolve(BUNDLE_ROOT, hash);
+  const bundleDir = resolve(opts?.bundleRoot ?? BUNDLE_ROOT, hash);
   const bundlePath = resolve(bundleDir, "main.js");
   if (!existsSync(bundlePath)) return null;
   // Mark it as in use for the cache pruner (#491): a daemon that resolves a
