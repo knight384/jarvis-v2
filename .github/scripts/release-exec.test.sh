@@ -25,7 +25,7 @@
 #   3. the structure check run against mutated copies of the workflow, one hole
 #      per copy, each of which must be reported -- so a structure check that
 #      has been neutered fails here instead of passing everything.
-#   Plus one sink executed directly -- publish-brain's `npm version` -- with a
+#   Plus one sink executed directly -- pack-brain's `npm version` -- with a
 #   hostile value and no validator in front of it, to show the env-quoted form
 #   is safe on its own and not just because the gate stopped the input.
 #
@@ -68,9 +68,22 @@ const findStep = (job, pred) => (jobs[job]?.steps ?? []).find(pred);
 if (mode === "validator" || mode === "step") {
   const step = mode === "validator"
     ? findStep("validate-tag", (s) => s.id === "validate")
-    : findStep(process.argv[2], (s) => s.name === process.argv[3]);
+    : findStep(process.argv[2], (s) => s.name === process.argv[3] || s.id === process.argv[3]);
   if (!step || typeof step.run !== "string") process.exit(3);
   process.stdout.write(step.run);
+  process.exit(0);
+}
+if (mode === "run-expressions") {
+  // #684: the same rule as the structure check below, for any workflow:
+  // no `run:` (or github-script `script:`) contains a ${{ }} expression.
+  const found = [];
+  for (const [name, job] of Object.entries(jobs))
+    for (const [i, s] of (job.steps ?? []).entries()) {
+      const label = name + ": step " + (s.name ?? s.id ?? s.uses ?? String(i));
+      if (typeof s.run === "string" && s.run.includes("${{")) found.push(label + " has a ${{ }} expression inside run:");
+      if (typeof s.with?.script === "string" && s.with.script.includes("${{")) found.push(label + " has a ${{ }} expression inside a script: input");
+    }
+  if (found.length) console.log(found.join("\n"));
   process.exit(0);
 }
 // mode === "structure": one violation per line, nothing when clean.
@@ -159,6 +172,47 @@ const reaches = (j, seen = new Set()) => {
 };
 for (const name of Object.keys(jobs))
   if (name !== "validate-tag" && !reaches(name)) out.push(name + ": does not run downstream of validate-tag");
+// #682: every job that installs dependencies runs either before the sidecar
+// workflow starts (upstream of it) or after it has published (downstream).
+// Running alongside it, a lifecycle script could swap a sidecar artifact
+// between its upload and the download in publish-sidecar.
+const upstreamOf = (j, target, seen = new Set()) => {
+  if (j === target) return true;
+  if (seen.has(j)) return false;
+  seen.add(j);
+  return needsOf(j).some((n) => upstreamOf(n, target, seen));
+};
+for (const [name, job] of Object.entries(jobs)) {
+  const runs = (job.steps ?? []).map((st) => typeof st.run === "string" ? st.run : "").join("\n");
+  const depCode = /\b(?:bun\s+(?:install|i|add|run|test|x)|bunx|npx|npm\s+(?:ci|install|i|run|run-script|test|pack|exec|x))\b/;
+  if (!depCode.test(runs) || !jobs.sidecar) continue;
+  if (!upstreamOf("sidecar", name) && !upstreamOf(name, "sidecar"))
+    out.push(name + ": installs dependencies while the sidecar workflow may still be running (neither before nor after it)");
+}
+// ...and ordering covers only publish-sidecar. A job that consumes the
+// sidecar-* artifacts later (github-release attaches them) checks them
+// against the digests publish-sidecar recorded, which arrive as a job output.
+for (const [name, job] of Object.entries(jobs)) {
+  const steps = job.steps ?? [];
+  // A download reaches the sidecar artifacts when it names none (that is
+  // all of them) or its name or glob matches a sidecar artifact name.
+  const glob = (g) => new RegExp("^" + String(g).replace(/[.+^$(){}|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
+  const reaches = (st) => {
+    const w = st.with ?? {};
+    if (w.name === undefined && w.pattern === undefined) return true;
+    return ["sidecar-linux-x64", "sidecar-win32-x64", "sidecar-darwin-arm64"].some((n) => glob(w.pattern ?? w.name).test(n));
+  };
+  const dl = steps.findIndex((st) => String(st.uses ?? "").startsWith("actions/download-artifact@") && reaches(st));
+  if (dl < 0) continue;
+  // Same condition as the download (or none), so it cannot be switched off
+  // on its own.
+  const cond = steps[dl].if;
+  const v = steps.findIndex((st, i) => i > dl && typeof st.run === "string" && /\bsha256sum\b[^\n]*-c\b/.test(st.run) &&
+    /needs\.sidecar\.outputs\.sums/.test(JSON.stringify(st.env ?? {})) && (st.if === undefined || st.if === cond));
+  if (v < 0) out.push(name + ": uses the sidecar artifacts without checking them against needs.sidecar.outputs.sums");
+  else if (steps.slice(dl + 1, v).some((st) => st.run !== undefined || st.uses))
+    out.push(name + ": does something with the sidecar artifacts before checking their digests");
+}
 if (out.length) console.log(out.join("\n"));
 ' "$@"
 }
@@ -362,7 +416,7 @@ await Bun.write(process.env.TO, s.replace(process.env.OLD, process.env.NEW));
 	mutant 'a ${{ }} expression back inside a run:' \
 		'run: npm version "$VERSION"' 'run: npm version "${{ needs.validate-tag.outputs.version }}"'
 	mutant 'a consumer that does not list validate-tag in needs' \
-		'needs: [validate-tag, test, build-docker, sidecar]' 'needs: [test, build-docker, sidecar]'
+		'needs: [validate-tag, pack-brain, build-docker, sidecar]' 'needs: [pack-brain, build-docker, sidecar]'
 	mutant 'RELEASE_TAG back in the workflow env' \
 		'  DRY_RUN: ${{ inputs.dry_run || false }}' '  DRY_RUN: ${{ inputs.dry_run || false }}
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}'
@@ -409,19 +463,57 @@ await Bun.write(process.env.TO, s.replace(process.env.OLD, process.env.NEW));
 ' ''
 	mutant 'cancel-in-progress on the publish group (#645)' \
 		'  cancel-in-progress: false' '  cancel-in-progress: true'
+	mutant 'the brain build running alongside the sidecar workflow (#682)' \
+		'    needs: [validate-tag, test, build-docker, sidecar]' '    needs: [validate-tag, test, build-docker]'
+	mutant 'the GitHub Release attaching sidecar binaries without checking their digests (#682)' \
+		"printf '%s' \"\$SUMS\" | base64 -d | sha256sum --strict -c -" "true"
+	mutant 'the sidecar digest check switched off on its own (#682)' \
+		$'      - name: Verify sidecar binaries\n        if: needs.sidecar.outputs.released == \'true\'' $'      - name: Verify sidecar binaries\n        if: false'
+	mutant 'a download of every artifact attached without a digest check (#682)' \
+		$'          path: artifacts\n          pattern: sidecar-*\n\n      # Exactly the bytes' $'          path: artifacts\n\n      - run: ls artifacts\n\n      # Exactly the bytes'
 	mutant 'a job no longer downstream of the gate' \
 		'  test:
     needs: validate-tag' '  test:'
 }
 
 echo
+echo "sidecar-release.yml: no \${{ }} inside run: (#684)"
+# The reusable sidecar workflow runs in the same release, and its publish job
+# holds id-token too. Its versions come from sidecar/VERSION rather than the
+# tag, so the gate above does not cover them; the structure rule does.
+SIDECAR_WORKFLOW="${SIDECAR_RELEASE_WORKFLOW:-${HERE}/../workflows/sidecar-release.yml}"
+found="$(YQ_FILE="$SIDECAR_WORKFLOW" yq run-expressions)" || {
+	no "sidecar-release.yml run-expression check ran" "the bun helper failed"
+	found=""
+}
+if [ -z "$found" ]; then
+	ok "sidecar-release.yml: every run: takes its values through env:"
+else
+	no "sidecar-release.yml: every run: takes its values through env:" "$found"
+fi
+copy="${WORK}/sidecar-mutant.yml"
+# shellcheck disable=SC2016 # JavaScript source, not shell.
+FROM="$SIDECAR_WORKFLOW" TO="$copy" bun -e '
+const s = await Bun.file(process.env.FROM).text();
+const anchor = "npm version \"${VERSION}\" --no-git-tag-version --allow-same-version";
+if (!s.includes(anchor)) process.exit(2);
+await Bun.write(process.env.TO, s.replace(anchor, "npm version \"${{ needs.resolve.outputs.version }}\" --no-git-tag-version --allow-same-version"));
+' || no "the sidecar mutant could be applied (the workflow no longer has the text it mutates)"
+if [ -f "$copy" ] && [ -n "$(YQ_FILE="$copy" yq run-expressions)" ]; then
+	ok "reports: a \${{ }} expression back inside a sidecar-release.yml run:"
+else
+	no "reports: a \${{ }} expression back inside a sidecar-release.yml run:"
+fi
+
+echo
 echo "sink executed without the gate in front of it"
-# publish-brain's `npm version` is the line #644 named. Run its script with a
-# hostile VERSION in env and an npm stub that records its argv: the value must
-# arrive as one literal argument and run nothing.
-SINK="$(yq step publish-brain 'Set package version')" || SINK=""
+# The brain's `npm version` is the line #644 named (in publish-brain then,
+# in pack-brain since #682 split the build out of the OIDC job). Run its
+# script with a hostile VERSION in env and an npm stub that records its argv:
+# the value must arrive as one literal argument and run nothing.
+SINK="$(yq step pack-brain 'Set package version')" || SINK=""
 if [ -z "$SINK" ]; then
-	no "found publish-brain's 'Set package version' step"
+	no "found pack-brain's 'Set package version' step"
 else
 	mkdir -p "${WORK}/bin"
 	cat >"${WORK}/bin/npm" <<'EOF'
@@ -441,6 +533,63 @@ EOF
 $(cat "${WORK}/argv" 2>/dev/null)"
 	else
 		ok "the npm version step passes a hostile VERSION as one literal argument and runs nothing"
+	fi
+fi
+
+echo
+echo "sidecar version gate (sidecar-release.yml resolve step, executed verbatim)"
+# #684. The sidecar version comes from sidecar/VERSION, not the tag, so the
+# gate above never sees it. resolve now checks it before it becomes an output;
+# run that script against hostile file contents (dry run, so it never reaches
+# npm) and check what reaches $GITHUB_OUTPUT.
+RESOLVE="$(YQ_FILE="$SIDECAR_WORKFLOW" yq step resolve v)" || RESOLVE=""
+if [ -z "$RESOLVE" ]; then
+	no "found sidecar-release.yml's resolve step"
+else
+	# sidecar_resolve <file contents>: sets RC and OUT.
+	# sidecar_resolve <file contents> [locale]
+	sidecar_resolve() {
+		rm -rf "${WORK}/sc" && mkdir -p "${WORK}/sc/sidecar"
+		printf '%s' "$1" >"${WORK}/sc/sidecar/VERSION"
+		: >"${WORK}/sc/out"
+		local -a envs=(PATH="$PATH" GITHUB_OUTPUT="${WORK}/sc/out" DRY_RUN=true)
+		[ -n "${2:-}" ] && envs+=(LC_ALL="$2" LANG="$2")
+		(cd "${WORK}/sc" && env -i "${envs[@]}" bash -c "$RESOLVE") >"${WORK}/sc/log" 2>&1
+		RC=$?
+		OUT="$(cat "${WORK}/sc/out")"
+	}
+	for v in 0.10.0 $'0.10.0\n' 1.2.3-rc.1 1.2.3-alpha-1.beta.11 10.20.30; do
+		sidecar_resolve "$v"
+		# The file normally ends in a newline, which $(cat) drops.
+		if [ "$RC" -eq 0 ] && [ "$OUT" = "$(printf 'version=%s\nshould_release=true' "${v%$'\n'}")" ]; then
+			ok "sidecar resolve accepts $(printf '%q' "$v")"
+		else
+			no "sidecar resolve accepts $(printf '%q' "$v")" "exit ${RC}; output: ${OUT}; log: $(cat "${WORK}/sc/log")"
+		fi
+	done
+	for v in '' '1.2' '01.2.3' '1.2.3+build' $'1.2.3\nshould_release=false' "1.2.3\$(touch ${WORK}/pwned)" \
+		"1.2.3\";touch ${WORK}/pwned;\"" '1.2.3|x' '1.2.3/x' '1.2.3-' "1.2.3-rc.1 " '1.2.3-01' '1.2.3-rc..1'; do
+		rm -f "${WORK}/pwned"
+		sidecar_resolve "$v"
+		if [ "$RC" -ne 0 ] && [ -z "$OUT" ] && [ ! -e "${WORK}/pwned" ] && grep -qF '::error::sidecar/VERSION is not a plain semver' "${WORK}/sc/log"; then
+			ok "sidecar resolve rejects $(printf '%q' "$v") without writing outputs"
+		else
+			no "sidecar resolve rejects $(printf '%q' "$v")" "exit ${RC}; output: ${OUT}; log: $(cat "${WORK}/sc/log")"
+		fi
+	done
+	# Under a UTF-8 locale glibc's [A-Za-z] and [0-9] match more than ASCII;
+	# the step pins LC_ALL=C, as the tag gate does.
+	if [ -z "$UTF8_LOCALE" ]; then
+		echo "  skip - no en_US.UTF-8 locale on this machine, so the sidecar locale fixtures cannot run"
+	else
+		for v in $'1.2.3-\u00e9' $'\u0661.2.3' $'1.2.3-\uff41'; do
+			sidecar_resolve "$v" "$UTF8_LOCALE"
+			if [ "$RC" -ne 0 ] && [ -z "$OUT" ]; then
+				ok "sidecar resolve rejects $(printf '%q' "$v") under ${UTF8_LOCALE}"
+			else
+				no "sidecar resolve rejects $(printf '%q' "$v") under ${UTF8_LOCALE}" "exit ${RC}; output: ${OUT}"
+			fi
+		done
 	fi
 fi
 
