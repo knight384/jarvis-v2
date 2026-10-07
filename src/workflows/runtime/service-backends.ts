@@ -41,7 +41,7 @@ import type { CredentialResolver } from "../credentials/adapter";
 import { WorkflowEventBuffer } from "./event-buffer";
 import { cancellableWorkflowService } from "./cancellation";
 import { WorkflowEffectBoundary, workflowEffectId, type WorkflowAuthorityDependencies } from './effect-boundary';
-import { getWorkflowEffect } from '../db/repos/workflow-effect';
+import { getWorkflowEffect, saveWorkflowEffect } from '../db/repos/workflow-effect';
 import { resolveToolGate, severityRank } from '../../authority/tool-action-map';
 import { GATED_TOOL_NAMES, OPAQUE_TOOL_NAMES, refusedEffectCategory, surfaceBoundRefusal, toolEffectCapability } from './effect-capabilities';
 import { ActionOutcomeError } from '../../actions/action-outcome';
@@ -396,13 +396,13 @@ export function buildSandboxServiceBackends(
       dispatch: async (registry, call) => {
         // Every refusal below goes through here, so each one is audited under
         // the RUN as well (#672). A call this route parks or dispatches gets a
-        // `workflow:<runId>` row from the boundary; one it refuses got only the
-        // sub-agent gate's row, under the spawned child's id and the role's
-        // name, which names neither the run nor the step -- so the run's own
-        // audit showed the delegation allowed and then nothing. `toolsInvoke`
-        // and `pieceAuthorize` audit their refusals the same way.
+        // `workflow:<runId>` row from the boundary; one it refused got only the
+        // sub-agent gate's row, which before #730 was under the spawned
+        // child's id and named neither the run nor the step -- so the run's
+        // own audit showed the delegation allowed and then nothing.
+        // `toolsInvoke` and `pieceAuthorize` audit their refusals the same way.
         //
-        // On a first pass `sub-agent-runner.ts` also writes the child's row.
+        // On a first pass `sub-agent-runner.ts` also writes the gate's row.
         // On a RESUME it does not: it hands the parked call straight back here
         // without re-running its gate or writing a row, so for a refusal on
         // resume this row is the only one -- before #672 there was none. The
@@ -412,24 +412,49 @@ export function buildSandboxServiceBackends(
         // two calls), when the tool's gate changed while the call was parked.
         //
         // The category is the worse of the parked call's (the runner's gate at
-        // park time, which is what the child row says) and the gate recomputed
+        // park time, which is what the gate's row says) and the gate recomputed
         // now, which is what the last refusal decides on. On a first pass the
         // two are the same; on resume the parked one alone could record a
         // write that was refused as a command.
         //
-        // What this does NOT cover, so the rule is "every call that reaches
-        // this route has a row under the run" and not "every sub-agent decision
-        // does": anything the runner decides itself never reaches here -- any
-        // denial by its gate (level, profile, taint, override, context rule),
-        // an off-list refusal, any call it allows outright -- and keeps only
-        // the child's row; and an emergency suspension or an unknown tool name
-        // returns before the runner audits at all, so has no row anywhere.
-        // Closing those needs the runner to know the run, which it does not.
+        // What the runner decides itself never reaches here -- any denial by
+        // its gate (level, profile, taint, override, context rule), an
+        // off-list refusal, any call it allows outright, an emergency
+        // suspension. Those rows are under the run too since #730, not here:
+        // `m7-agent-delegator.ts` hands the runner `runScopedAuditTrail`,
+        // which writes them as `workflow:<runId>` with the step and the child
+        // in the name. An unknown tool name still writes no row anywhere, on
+        // purpose: it is not a governance decision and has no category.
+        // #731. A call refused HERE on a resume was parked by the first pass,
+        // so it has an `agent-tool:N` record, `pending`, whose approval was
+        // then granted. The boundary never sees the refusal, so nothing moved
+        // that record: it stayed pending with its approval approved for good,
+        // and the run's effects gave an operator no way to tell it had been
+        // refused. It is marked `blocked`, denied, with the refusal as its
+        // reason -- what the boundary writes for its own refusals -- which is
+        // terminal: `invoke` throws a non-pending record's error rather than
+        // dispatching it, and the approval scheduler resumes only `pending`.
+        //
+        // Only THIS call's record: the same route, still pending, with the
+        // request digest the dispatch below would have bound. A refusal on a
+        // first pass has no record and gets none. The approval row itself is
+        // left as it is, as on every boundary refusal: a workflow-owned
+        // approval's truth is its effect record (`reconcileAfterRestart`).
+        // Synchronous from the read to the write, so nothing can claim the
+        // record in between.
+        const blockParkedEffect = (reason: string): void => {
+          const parked = getWorkflowEffect(
+            workflowEffectId(resolved.run.id, resolved.stepName, resolved.executionPath, `agent-tool:${call.sequence}`));
+          if (!parked || parked.status !== 'pending') return;
+          if (parked.requestDigest !== digest({ toolName: call.toolCall.name, arguments: call.toolCall.arguments })) return;
+          saveWorkflowEffect({ ...parked, status: 'blocked', decision: 'denied', error: reason, reason, finishedAt: Date.now() });
+        };
         const gate = resolveToolGate(registry.get(call.toolCall.name), call.toolCall.name, call.toolCall.arguments);
         const refusedCategory = severityRank(gate.actionCategory) > severityRank(call.actionCategory)
           ? gate.actionCategory : call.actionCategory;
         const refuse = (reason: string) => {
           effects.auditRefusal({ context: ctx, toolName: call.toolCall.name, category: refusedCategory });
+          blockParkedEffect(reason);
           return { kind: 'denied' as const, reason };
         };
         // The same rule as the direct tool piece: a category cannot describe
